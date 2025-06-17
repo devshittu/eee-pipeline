@@ -1,0 +1,178 @@
+# docker-compose.yml
+# File path: docker-compose.yml
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 3s
+      retries: 5
+    restart: always
+
+  ner-service:
+    build:
+      context: .
+      dockerfile: Dockerfile_ner
+    container_name: ner-service
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./config:/app/config:ro
+      - ./logs:/app/logs
+      - ./model_cache/hf:/app/cache/hf
+    environment:
+      PYTHONUNBUFFERED: "1"
+      HF_HOME: "/app/cache/hf"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              count: all
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: always
+
+  dp-service:
+    build:
+      context: .
+      dockerfile: Dockerfile_dp # Corrected indentation
+    container_name: dp-service
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./config:/app/config:ro
+      - ./logs:/app/logs
+      - ./model_cache/spacy:/app/cache/spacy
+    environment:
+      PYTHONUNBUFFERED: "1"
+      SPACY_DATA: "/app/cache/spacy" # For spaCy models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              count: all
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: always
+
+  event-llm-service:
+    build:
+      context: .
+      dockerfile: Dockerfile_event_llm
+    container_name: event-llm-service
+    ports:
+      - "8003:8003"
+    volumes:
+      - ./config:/app/config:ro
+      - ./logs:/app/logs
+      - ./model_cache/llm:/app/cache/llm # For LLM models
+    environment:
+      PYTHONUNBUFFERED: "1"
+      LLM_MODEL_PATH: "/app/cache/llm" # For custom LLM fine-tuning paths
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              count: all
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    restart: always
+
+
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile_celery_worker
+    container_name: celery-worker
+    volumes:
+      - ./config:/app/config:ro
+      - ./logs:/app/logs
+      - ./model_cache/hf:/app/cache/hf
+      - ./model_cache/spacy:/app/cache/spacy
+      - ./model_cache/llm:/app/cache/llm
+    environment:
+      PYTHONUNBUFFERED: "1"
+      CELERY_BROKER_URL: "redis://redis:6379/0"
+      CELERY_RESULT_BACKEND: "redis://redis:6379/0"
+      HF_HOME: "/app/cache/hf"
+      SPACY_DATA: "/app/cache/spacy"
+      LLM_MODEL_PATH: "/app/cache/llm"
+    depends_on:
+      redis:
+        condition: service_healthy
+      ner-service: # Worker needs access to services it directly calls (if using local API calls)
+        condition: service_healthy
+      dp-service:
+        condition: service_healthy
+      event-llm-service:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              count: all
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A src.core.celery_tasks inspect ping | grep -q 'pong'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: always
+
+  orchestrator-service:
+    build:
+      context: .
+      dockerfile: Dockerfile_orchestrator
+    container_name: orchestrator-service
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config:/app/config:ro
+      - ./logs:/app/logs
+      - ./data:/app/data # For batch processing input/output files
+    environment:
+      PYTHONUNBUFFERED: "1"
+      CELERY_BROKER_URL: "redis://redis:6379/0" # Orchestrator needs to talk to Redis for Celery
+      CELERY_RESULT_BACKEND: "redis://redis:6379/0"
+    depends_on:
+      redis:
+        condition: service_healthy
+      ner-service:
+        condition: service_healthy
+      dp-service:
+        condition: service_healthy
+      event-llm-service:
+        condition: service_healthy
+      celery-worker: # Orchestrator depends on worker for batch processing (optional, but good for health checks)
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: always
+
+volumes:
+  redis_data:
+  model_cache:
+  logs:
+  data:
