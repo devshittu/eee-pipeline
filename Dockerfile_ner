@@ -1,0 +1,69 @@
+# Dockerfile_ner
+# File path: Dockerfile_ner
+
+# Use NVIDIA CUDA base image for GPU support
+ARG CUDA_VERSION="12.3.2"
+ARG CUDNN_VERSION="9"
+FROM nvcr.io/nvidia/cuda:${CUDA_VERSION}-cudnn${CUDNN_VERSION}-runtime-ubuntu22.04 AS base
+
+# Set environment variables
+ENV PYTHONUNBUFFERED 1
+ENV DEBIAN_FRONTEND noninteractive
+
+# Install common dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    python3.10 python3.10-venv python3-pip \
+    curl build-essential && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create a virtual environment
+ENV VIRTUAL_ENV=/opt/venv
+RUN python3.10 -m venv $VIRTUAL_ENV
+# Add the virtual environment to PATH early for explicit pip usage
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+# Stage 1: Build stage - Install dependencies
+FROM base AS build
+
+WORKDIR /app
+
+# Copy only requirements to leverage Docker cache
+COPY requirements_ner.txt .
+
+# Install Python dependencies explicitly into the virtual environment
+RUN pip install --no-cache-dir -r requirements_ner.txt
+
+# Stage 2: Final stage - Copy application code and runtime dependencies
+FROM base AS final
+
+WORKDIR /app
+
+# Copy virtual environment from build stage
+COPY --from=build ${VIRTUAL_ENV} ${VIRTUAL_ENV}
+
+# Copy application code
+COPY src ./src
+COPY config ./config
+
+# Set Hugging Face cache directory
+ENV HF_HOME="/app/cache/hf"
+# Create cache directory and ensure permissions
+RUN mkdir -p /app/cache/hf && chmod -R 777 /app/cache
+
+# Expose the port the service will run on
+EXPOSE 8001
+
+# Re-assert PATH for runtime environment to ensure virtual environment's bin is primary
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+# Copy and set up entrypoint script
+COPY entrypoint_ner.sh .
+RUN chmod +x entrypoint_ner.sh
+
+# Set the entrypoint
+ENTRYPOINT ["./entrypoint_ner.sh"]
+
+# Command to run the application (will be called by entrypoint)
+CMD ["uvicorn", "src.api.ner_service:app", "--host", "0.0.0.0", "--port", "8001"]
