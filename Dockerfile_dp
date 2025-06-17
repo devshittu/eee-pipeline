@@ -1,0 +1,63 @@
+# Use NVIDIA CUDA base image for GPU support
+ARG CUDA_VERSION="12.3.2"
+ARG CUDNN_VERSION="9"
+FROM nvcr.io/nvidia/cuda:${CUDA_VERSION}-cudnn${CUDNN_VERSION}-runtime-ubuntu22.04 AS base
+
+# Set environment variables
+ENV PYTHONUNBUFFERED 1
+ENV DEBIAN_FRONTEND noninteractive
+
+# Install common dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    python3.10 python3.10-venv python3-pip \
+    curl build-essential && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create a virtual environment
+ENV VIRTUAL_ENV="/opt/venv"
+RUN python3.10 -m venv $VIRTUAL_ENV
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+# Stage 1: Build stage - Install dependencies and model
+FROM base AS build
+
+WORKDIR /app
+
+# Copy only requirements to leverage Docker cache
+COPY requirements_dp.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements_dp.txt
+
+# Pre-install the spaCy model
+RUN python -m spacy download en_core_web_trf
+
+# Stage 2: Final stage - Copy application code and runtime dependencies
+FROM base AS final
+
+WORKDIR /app
+
+# Copy virtual environment (with model) from build stage
+COPY --from=build ${VIRTUAL_ENV} ${VIRTUAL_ENV}
+
+# Copy application code
+COPY src ./src
+COPY config ./config
+
+# Expose the port the service will run on
+EXPOSE 8002
+
+# Copy and set up entrypoint script
+COPY entrypoint_dp.sh .
+RUN chmod +x entrypoint_dp.sh
+
+# Set the entrypoint
+ENTRYPOINT ["./entrypoint_dp.sh"]
+
+# Command to run the application (will be called by entrypoint)
+CMD ["uvicorn", "src.api.dp_service:app", "--host", "0.0.0.0", "--port", "8002"]
+
+# Dockerfile_dp
+# File path: Dockerfile_dp
