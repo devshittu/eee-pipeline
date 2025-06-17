@@ -1,0 +1,60 @@
+# Python generated files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+*.env
+
+# Docker generated files
+docker-compose.yml.bak
+docker-compose.override.yml
+*.dockerignore
+
+# Generated data and model files
+data/
+models/
+model_cache/
+checkpoints/
+**/*_data/*
+lightning_logs/
+inference_logs.txt
+
+# MLflow artifacts
+mlruns/
+mlflow.db
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Miscellaneous
+*.bak
+*.bak*
+*.tmp
+*.temp
+temp/
+tmp/
+.collate/
+
+# Sensitive files
+*.key
+*.pem
+*.crt
+secrets/
+credentials.json
+
