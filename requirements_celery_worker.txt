@@ -1,0 +1,25 @@
+# requirements_celery_worker.txt
+# File path: requirements_celery_worker.txt
+
+celery==5.3.6
+redis==5.0.1 # For Celery broker and backend
+dask==2024.5.1
+distributed==2024.5.1 # Dask's distributed scheduler and workers
+pydantic==2.7.1
+pydantic-settings==2.2.1
+python-json-logger==2.0.7
+PyYAML==6.0.1
+# Also include requirements for the core logic of processing a single document
+# as the worker will be orchestrating internal calls to other services
+# or potentially loading models itself if services are not exposed/reachable (not recommended here)
+# Since this worker will call the other *services*, it needs HTTP client capabilities:
+httpx==0.27.0
+# The core schemas it will use for payloads
+# The specific model dependencies are handled by the respective service's Dockerfile
+# But if you want to load models directly in worker, you'd add:
+# transformers==4.41.2
+# torch==2.3.0
+# spacy==3.7.4
+# accelerate==0.30.1
+# bitsandbytes==0.43.1
+# sentencepiece==0.1.99
