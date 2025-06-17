@@ -1,0 +1,112 @@
+# config/settings.yaml
+# File path: config/settings.yaml
+
+general:
+  log_level: INFO
+  gpu_enabled: True # Set to False if no GPU is available or you want to disable it
+
+ner_service:
+  port: 8001
+  model_name: "Babelscape/wikineural-multilingual-ner"
+  model_cache_dir: "/app/cache/hf"
+
+dp_service:
+  port: 8002
+  model_name: "en_core_web_trf" # Example spaCy transformer model
+  model_cache_dir: "/app/cache/spacy"
+
+event_llm_service:
+  port: 8003
+  model_name: "google/flan-t5-large" # Example LLM model name
+  model_path: "/app/cache/llm/flan-t5-large" # Path to your fine-tuned or downloaded LLM
+  # Consider a smaller model if A4000 16GB RAM is a constraint for larger models
+  # e.g., "stabilityai/stablelm-zephyr-3b" or a quantized Llama-2-7B variant
+  model_cache_dir: "/app/cache/llm"
+  max_new_tokens: 512
+  temperature: 0.7
+  top_p: 0.9
+
+orchestrator_service:
+  port: 8000
+  ner_service_url: "http://ner-service:8001"
+  dp_service_url: "http://dp-service:8002"
+  event_llm_service_url: "http://event-llm-service:8003"
+  batch_processing_chunk_size: 100 # Number of documents to process in one Celery task
+  batch_processing_job_results_ttl: 3600 # seconds (1 hour)
+
+celery:
+  broker_url: "redis://redis:6379/0"
+  result_backend: "redis://redis:6379/0"
+  task_acks_late: True # Task is not acknowledged until it's actually finished
+  worker_prefetch_multiplier: 1 # Workers only take one task at a time for long-running jobs
+  # For Dask integration within Celery worker
+  dask_local_cluster_n_workers: null # null or number of workers (e.g., 22 for Threadripper PRO 5945WX)
+  dask_local_cluster_threads_per_worker: 1 # Typically 1 thread per worker for CPU-bound tasks
+  dask_local_cluster_memory_limit: "150GB" # e.g., 150GB for 160GB RAM, leave some for OS
+
+logging:
+  version: 1
+  disable_existing_loggers: False
+  formatters:
+    json:
+      class: pythonjsonlogger.jsonlogger.JsonFormatter
+      format: "%(levelname)s %(asctime)s %(filename)s %(funcName)s %(lineno)d %(message)s"
+  handlers:
+    console:
+      class: logging.StreamHandler
+      formatter: json
+      stream: ext://sys.stdout
+    ner_file:
+      class: logging.handlers.RotatingFileHandler
+      formatter: json
+      filename: /app/logs/ner_service.jsonl
+      maxBytes: 10485760 # 10 MB
+      backupCount: 5
+    dp_file:
+      class: logging.handlers.RotatingFileHandler
+      formatter: json
+      filename: /app/logs/dp_service.jsonl
+      maxBytes: 10485760 # 10 MB
+      backupCount: 5
+    event_llm_file:
+      class: logging.handlers.RotatingFileHandler
+      formatter: json
+      filename: /app/logs/event_llm_service.jsonl
+      maxBytes: 10485760 # 10 MB
+      backupCount: 5
+    orchestrator_file:
+      class: logging.handlers.RotatingFileHandler
+      formatter: json
+      filename: /app/logs/orchestrator_service.jsonl
+      maxBytes: 10485760 # 10 MB
+      backupCount: 5
+    celery_file:
+      class: logging.handlers.RotatingFileHandler
+      formatter: json
+      filename: /app/logs/celery_worker.jsonl
+      maxBytes: 10485760 # 10 MB
+      backupCount: 5
+  root:
+    handlers: [console]
+    level: INFO
+  loggers:
+    ner_service:
+      handlers: [ner_file, console]
+      level: INFO
+      propagate: False
+    dp_service:
+      handlers: [dp_file, console]
+      level: INFO
+      propagate: False
+    event_llm_service:
+      handlers: [event_llm_file, console]
+      level: INFO
+      propagate: False
+    orchestrator_service:
+      handlers: [orchestrator_file, console]
+      level: INFO
+      propagate: False
+    celery_worker:
+      handlers: [celery_file, console]
+      level: INFO
+      propagate: False
