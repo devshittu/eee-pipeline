@@ -1,0 +1,15 @@
+# requirements_orchestrator.txt
+# File path: requirements_orchestrator.txt
+
+fastapi==0.111.0
+uvicorn==0.30.1
+pydantic==2.7.1
+pydantic-settings==2.2.1
+httpx==0.27.0 # For making HTTP requests to other microservices
+celery==5.3.6 # For dispatching tasks to Celery workers
+redis==5.0.1 # For Celery broker and backend
+python-json-logger==2.0.7
+PyYAML==6.0.1
+# For CLI processing using Dask (if process-file uses Dask)
+dask==2024.5.1
+distributed==2024.5.1
