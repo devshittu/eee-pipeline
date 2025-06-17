@@ -1,0 +1,18 @@
+# requirements_dp.txt
+# File path: requirements_dp.txt
+
+fastapi==0.100.0
+uvicorn==0.30.1
+pydantic==2.7.1
+pydantic-settings==2.2.1
+spacy==3.7.4
+typer==0.9.0 # Explicitly set for compatibility with spacy and to avoid fastapi-cli conflict
+# Need to download specific spaCy models like en_core_web_trf separately
+# pip install https://github.com/explosion/spacy-models/releases/download/en_core_web_trf-3.7.4/en_core_web_trf-3.7.4.tar.gz
+# or stanza if chosen: stanza==1.8.0
+python-json-logger==2.0.7
+PyYAML==6.0.1
+# Additional dependencies for spaCy transformer models
+torch==2.3.0
+transformers==4.41.2
+accelerate==0.30.1
