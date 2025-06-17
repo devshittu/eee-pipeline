@@ -1,0 +1,72 @@
+# Dockerfile_celery_worker
+# File path: Dockerfile_celery_worker
+
+# Use NVIDIA CUDA base image for GPU support
+ARG CUDA_VERSION="12.3.2"
+ARG CUDNN_VERSION="9"
+FROM nvcr.io/nvidia/cuda:${CUDA_VERSION}-cudnn${CUDNN_VERSION}-runtime-ubuntu22.04 AS base
+
+# Set environment variables
+ENV PYTHONUNBUFFERED 1
+ENV DEBIAN_FRONTEND noninteractive
+
+# Install common dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    python3.10 python3.10-venv python3-pip \
+    curl build-essential && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create a virtual environment
+ENV VIRTUAL_ENV=/opt/venv
+RUN python3.10 -m venv $VIRTUAL_ENV
+# Add the virtual environment to PATH early for explicit pip usage
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+# Stage 1: Build stage - Install dependencies
+FROM base AS build
+
+WORKDIR /app
+
+# Copy only requirements to leverage Docker cache
+COPY requirements_celery_worker.txt .
+
+# Install Python dependencies explicitly into the virtual environment
+# Use --extra-index-url for PyTorch if needed for specific CUDA versions
+RUN pip install --no-cache-dir -r requirements_celery_worker.txt
+
+# Stage 2: Final stage - Copy application code and runtime dependencies
+FROM base AS final
+
+WORKDIR /app
+
+# Copy virtual environment from build stage
+COPY --from=build ${VIRTUAL_ENV} ${VIRTUAL_ENV}
+
+# Copy application code
+COPY src ./src
+COPY config ./config
+
+# Create cache directories for models and ensure permissions, as worker might interact with them or download
+ENV HF_HOME="/app/cache/hf"
+ENV SPACY_DATA="/app/cache/spacy"
+ENV LLM_MODEL_PATH="/app/cache/llm"
+RUN mkdir -p /app/cache/hf /app/cache/spacy /app/cache/llm /app/logs && chmod -R 777 /app/cache /app/logs
+
+# Re-assert PATH for runtime environment to ensure virtual environment's bin is primary
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+# Copy and set up entrypoint script
+COPY entrypoint_celery_worker.sh .
+RUN chmod +x entrypoint_celery_worker.sh
+
+# Set the entrypoint
+ENTRYPOINT ["./entrypoint_celery_worker.sh"]
+
+# Command to run the Celery worker
+CMD ["celery", "-A", "src.core.celery_tasks", "worker", "-l", "info", "-P", "solo", "--concurrency", "1"]
+# Note: "-P solo" is used initially for debugging/simplicity.
+# For production, replace with "fork" or "eventlet/gevent" for true concurrency,
+# and adjust --concurrency based on desired Dask LocalCluster setup.
+# The actual Dask parallelism is managed *inside* the task execution logic.
