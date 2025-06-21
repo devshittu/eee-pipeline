@@ -15,14 +15,26 @@ dp_service:
   model_name: "en_core_web_trf" # Example spaCy transformer model
   model_cache_dir: "/app/cache/spacy"
 
+# event_llm_service:
+#   port: 8003
+#   model_name: "google/flan-t5-large" # Example LLM model name
+#   model_path: "/app/cache/llm/flan-t5-large" # Path to your fine-tuned or downloaded LLM
+#   # Consider a smaller model if A4000 16GB RAM is a constraint for larger models
+#   # e.g., "stabilityai/stablelm-zephyr-3b" or a quantized Llama-2-7B variant
+#   model_cache_dir: "/app/cache/llm"
+#   # max_new_tokens: 512
+#   max_new_tokens: 1024
+#   temperature: 0.7
+#   top_p: 0.9
+
+
 event_llm_service:
   port: 8003
-  model_name: "google/flan-t5-large" # Example LLM model name
-  model_path: "/app/cache/llm/flan-t5-large" # Path to your fine-tuned or downloaded LLM
-  # Consider a smaller model if A4000 16GB RAM is a constraint for larger models
-  # e.g., "stabilityai/stablelm-zephyr-3b" or a quantized Llama-2-7B variant
+  model_name: "mistralai/Mistral-7B-Instruct-v0.2" # CHANGED MODEL NAME
+  model_path: "/app/cache/llm/mistral-7b-instruct-v0.2" # Path to your fine-tuned or downloaded LLM
   model_cache_dir: "/app/cache/llm"
-  max_new_tokens: 512
+  request_timeout_seconds: 300 # Timeout for requests to the Event LLM service in seconds
+  max_new_tokens: 4096 # Keeping this as you expect large output
   temperature: 0.7
   top_p: 0.9
 
@@ -33,6 +45,7 @@ orchestrator_service:
   event_llm_service_url: "http://event-llm-service:8003"
   batch_processing_chunk_size: 100 # Number of documents to process in one Celery task
   batch_processing_job_results_ttl: 3600 # seconds (1 hour)
+  request_timeout_seconds: 300 # Timeout for requests to the orchestrator service in seconds
 
 celery:
   broker_url: "redis://redis:6379/0"
@@ -100,13 +113,13 @@ logging:
       propagate: False
     event_llm_service:
       handlers: [event_llm_file, console]
-      level: INFO
+      level: DEBUG # Changed to DEBUG for more detailed logs
       propagate: False
     orchestrator_service:
       handlers: [orchestrator_file, console]
-      level: INFO
+      level: DEBUG
       propagate: False
     celery_worker:
       handlers: [celery_file, console]
-      level: INFO
+      level: DEBUG
       propagate: False
