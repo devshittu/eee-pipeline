@@ -157,9 +157,11 @@ async def call_event_llm_service(http_client: httpx.AsyncClient, llm_input: Even
         # Convert Pydantic's HttpUrl object to a string for urljoin
         url = urljoin(
             str(settings.orchestrator_service.event_llm_service_url), "/generate-events")
+        request_timeout = settings.event_llm_service.request_timeout_seconds
         response = await http_client.post(
             url,
-            json=llm_input.dict()
+            json=llm_input.dict(),
+            timeout=request_timeout
         )
         response.raise_for_status()
         return EventLLMGenerateResponse.parse_obj(response.json())
@@ -193,7 +195,8 @@ async def process_single_document_pipeline_async(document_data: Dict[str, Any]) 
         # Crucial change: Initialize httpx.AsyncClient locally within the async function.
         # This prevents serialization issues when Dask sends tasks across processes.
         # The client will be properly closed when the 'async with' block exits.
-        async with httpx.AsyncClient(timeout=120.0) as http_client_local:
+        # Use the request_timeout_seconds from orchestrator_service settings for the default client timeout.
+        async with httpx.AsyncClient(timeout=settings.orchestrator_service.request_timeout_seconds) as http_client_local:
             # 1. Call NER Service, passing the local http_client_local
             ner_response = await call_ner_service(http_client_local, text)
 
