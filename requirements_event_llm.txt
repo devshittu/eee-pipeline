@@ -16,3 +16,4 @@ sentencepiece==0.1.99 # For some LLM tokenizers
 # flash-attn==2.6.0 # If using Flash Attention for speedup on supported GPUs
 python-json-logger==2.0.7
 PyYAML==6.0.1
+tenacity==8.2.3
