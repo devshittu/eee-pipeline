@@ -81,8 +81,11 @@ services:
       - ./config:/app/config:ro
       - ./logs:/app/logs
       - ./model_cache/llm:/app/cache/llm # For LLM models
+    env_file: # <-- ADD THIS BLOCK
+      - ./.env.dev # <-- This tells Docker Compose to load variables from .env.dev
     environment:
       PYTHONUNBUFFERED: "1"
+      # HF_TOKEN: ${HUGGINGFACE_TOKEN} # <-- Explicitly map your token to HF_TOKEN for Hugging Face libraries
       LLM_MODEL_PATH: "/app/cache/llm" # For custom LLM fine-tuning paths
     deploy:
       resources:
