@@ -37,6 +37,7 @@ class EventLLMServiceSettings(ServiceSettings):
     max_new_tokens: int = 512
     temperature: float = 0.7
     top_p: float = 0.9
+    request_timeout_seconds: int = 300
 
 
 class OrchestratorServiceSettings(ServiceSettings):
@@ -45,6 +46,7 @@ class OrchestratorServiceSettings(ServiceSettings):
     event_llm_service_url: HttpUrl
     batch_processing_chunk_size: int = 100
     batch_processing_job_results_ttl: int = 3600  # seconds
+    request_timeout_seconds: int = 120
 
 
 class CelerySettings(BaseModel):
