@@ -33,10 +33,12 @@ event_llm_service:
   model_name: "mistralai/Mistral-7B-Instruct-v0.2" # CHANGED MODEL NAME
   model_path: "/app/cache/llm/mistral-7b-instruct-v0.2" # Path to your fine-tuned or downloaded LLM
   model_cache_dir: "/app/cache/llm"
-  request_timeout_seconds: 300 # Timeout for requests to the Event LLM service in seconds
+  request_timeout_seconds: 900 # Timeout for requests to the Event LLM service in seconds
   max_new_tokens: 4096 # Keeping this as you expect large output
   temperature: 0.7
   top_p: 0.9
+  generation_max_retries: 3 # Number of retries if JSON parsing fails
+  generation_retry_delay_seconds: 2 # Delay in seconds between retries
 
 orchestrator_service:
   port: 8000
