@@ -38,6 +38,11 @@ class EventLLMServiceSettings(ServiceSettings):
     temperature: float = 0.7
     top_p: float = 0.9
     request_timeout_seconds: int = 300
+    generation_max_retries: int = Field(
+        3, description="Number of retries for LLM generation if output is invalid.")
+    generation_retry_delay_seconds: int = Field(
+        2, description="Delay in seconds between generation retries.")
+
 
 
 class OrchestratorServiceSettings(ServiceSettings):
@@ -116,6 +121,8 @@ if __name__ == "__main__":
           model_name: "test/llm"
           model_path: "/tmp/llm/model"
           model_cache_dir: "/tmp/llm"
+          generation_max_retries: 3
+          generation_retry_delay_seconds: 2
         orchestrator_service:
           port: 8000
           ner_service_url: "http://localhost:8001"
