@@ -1,0 +1,89 @@
+# docker-compose.dev.yml
+# File path: docker-compose.dev.yml
+# This file extends the production docker-compose.yml for development purposes.
+# It adds volume mounts for the src directory to enable live code reloading (hot-reloading)
+# and overrides the command for API services to include uvicorn's --reload flag.
+# For Celery worker and orchestrator, src is mounted, but no --reload equivalent is applied
+# as they require manual container restarts for code changes. This preserves production config
+# unchanged. Use with: docker compose -f docker-compose.yml -f docker-compose.dev.yml [command]
+# Retains all comments and structure from production to avoid regressions.
+# Note: Model caches are already mounted in production, so they persist in dev without changes.
+# Entrypoints remain unchanged; model loading happens at startup, and hot-reload applies to API routes.
+
+
+services:
+  ner-service:
+    # Mount src for live code changes
+    volumes:
+      - ./src:/app/src
+    # Override command to enable hot-reload for development
+    command: ["uvicorn", "src.api.ner_service:app", "--host", "0.0.0.0", "--port", "8001", "--reload"]
+    # No changes to build, environment, healthcheck, etc., to avoid regressions
+
+  dp-service:
+    # Mount src for live code changes
+    volumes:
+      - ./src:/app/src
+    # Override command to enable hot-reload for development
+    command: ["uvicorn", "src.api.dp_service:app", "--host", "0.0.0.0", "--port", "8002", "--reload"]
+    # No changes to build, environment, healthcheck, etc., to avoid regressions
+
+  event-llm-service:
+    # Mount src for live code changes
+    volumes:
+      - ./src:/app/src
+    # Override command to enable hot-reload for development
+    command: ["uvicorn", "src.api.event_llm_service:app", "--host", "0.0.0.0", "--port", "8003", "--reload"]
+    # No changes to build, environment, healthcheck, etc., to avoid regressions
+    # Note: .env.dev is already loaded in production for this service
+
+  celery-worker:
+    # Mount src for live code changes (requires manual restart for changes to take effect)
+    volumes:
+      - ./src:/app/src
+    # No command override; Celery worker does not support hot-reload like uvicorn.
+    # Retains original CMD from Dockerfile_celery_worker to avoid regressions.
+    # Dependencies and environment unchanged.
+
+  orchestrator-service:
+    # Mount src for live code changes
+    volumes:
+      - ./src:/app/src
+    # Override command to enable hot-reload for development
+    command: ["uvicorn", "src.api.orchestrator_service:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    # No changes to build, environment, healthcheck, etc., to avoid regressions
+
+# No new volumes defined here; inherits from production docker-compose.yml
+# This ensures production volumes (e.g., redis_data, model_cache) are preserved.
+
+
+
+
+# The below command can be used to start the development environment with hot-reloading.
+# docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build --force-recreate
+
+# To stop and remove containers, networks, and volumes created by the above command, use:
+# sudo rm -rf ./logs/* && docker compose -f docker-compose.yml -f docker-compose.dev.yml down -v
+
+
+
+
+# ---
+
+# Clean (Stop and Remove Containers, Clear Logs):
+# sudo rm -rf ./logs/* && docker compose -f docker-compose.yml -f docker-compose.dev.yml down -v
+
+# Rebuild All Services (Development Mode):
+# docker compose -f docker-compose.yml -f docker-compose.dev.yml build
+
+# Rebuild All Services (No Cache, Development Mode):
+# docker compose -f docker-compose.yml -f docker-compose.dev.yml build --no-cache
+
+# Rebuild Specific Service (e.g., ner-service, Development Mode):
+# docker compose -f docker-compose.yml -f docker-compose.dev.yml build ner-service
+
+# Start All Services with Live Logs (Development Mode):
+# docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --attach redis --attach ner-service --attach dp-service --attach event-llm-service --attach celery-worker --attach orchestrator-service
+
+# Start Specific Service with Live Logs (e.g., ner-service, Development Mode):
+# docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --attach ner-service
