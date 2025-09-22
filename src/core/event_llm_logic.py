@@ -10,11 +10,86 @@ from src.utils.config_manager import ConfigManager
 import json
 import re
 from pydantic import ValidationError
+from collections import defaultdict
+import uuid
 
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log, RetryCallState
 
-
+# Logger for the event LLM service
 logger = logging.getLogger("event_llm_service")
+
+
+# FIX: Define a simple custom exception for retry logic
+class LLMGenerationError(Exception):
+    """Custom exception raised when LLM generation or output parsing fails."""
+    pass
+
+
+def map_llm_output_fields(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Recursively maps incorrect field names from LLM output (e.g., 'predicate' to 'action')
+    to match the Pydantic schemas. This handles LLM hallucination of field names.
+    """
+    if isinstance(data, dict):
+        new_data = {}
+        for k, v in data.items():
+            new_k = k
+            # CRITICAL FIX: Map 'predicate' used by LLM to 'action' expected by SOATriplet
+            if k == 'predicate':
+                new_k = 'action'
+
+            new_data[new_k] = map_llm_output_fields(v)
+        return new_data
+    elif isinstance(data, list):
+        return [map_llm_output_fields(item) for item in data]
+    else:
+        return data
+
+
+def _extract_first_json_block(text: str) -> Optional[str]:
+    """
+    Universally extracts the first complete, top-level JSON object from a string,
+    handling trailing noise. Uses bracket counting for robustness.
+    """
+    start_index = text.find('{')
+    if start_index == -1:
+        return None
+
+    balance = 0
+    end_index = -1
+    in_string = False
+    escape = False
+
+    for i, char in enumerate(text[start_index:]):
+
+        if char == '\\':
+            escape = not escape
+            continue
+
+        if not escape:
+            if char == '"':
+                in_string = not in_string
+            elif not in_string:
+                if char == '{':
+                    balance += 1
+                elif char == '}':
+                    balance -= 1
+                    if balance == 0:
+                        end_index = start_index + i
+                        break
+        escape = False
+
+    if end_index != -1:
+        raw_json = text[start_index:end_index + 1]
+
+        # Final validation and cleanup: ensure it parses
+        try:
+            # We parse and re-dump to ensure the returned string is clean, canonical, and guaranteed parsable
+            return json.dumps(json.loads(raw_json))
+        except (json.JSONDecodeError, Exception):
+            return None  # Parsing failed, abandon this block
+
+    return None
 
 
 class EventLLMModel:
@@ -23,10 +98,15 @@ class EventLLMModel:
     Ensures the model is loaded only once.
     """
     _instance = None
+    # Reverting to original attribute names (model, tokenizer) for compatibility with API/health checks.
+    model = None
+    tokenizer = None
+    _config_manager = None
 
     # Define a list of diverse examples for few-shot prompting.
     # Each example contains an 'input' (EventLLMInput structure) and an 'output' (EventLLMGenerateResponse structure).
-    # These examples are designed to strictly adhere to the Pydantic schemas.
+    # NOTE: These examples are crucial for guiding the model and should be updated with more complex, real-world
+    # scenarios, especially for handling long-form text.
     _DIVERSE_EXAMPLES = [
         {
             "input": {
@@ -35,582 +115,651 @@ class EventLLMModel:
                     {"text": "Ukrainian", "type": "NORP",
                         "start_char": 0, "end_char": 9},
                     {"text": "Kharkiv", "type": "LOC",
-                        "start_char": 38, "end_char": 45},
-                    {"text": "villages", "type": "LOC",
-                        "start_char": 64, "end_char": 72}
-                ],
-                "soa_triplets": [
-                    {"subject": {"text": "Ukrainian forces", "start_char": 0, "end_char": 16}, "action": {"text": "launched",
-                                                                                                          "start_char": 17, "end_char": 25}, "object": {"text": "counteroffensive", "start_char": 27, "end_char": 43}},
-                    {"subject": {"text": "Ukrainian forces", "start_char": 0, "end_char": 16}, "action": {
-                        "text": "reclaiming", "start_char": 53, "end_char": 63}, "object": {"text": "villages", "start_char": 64, "end_char": 72}}
+                        "start_char": 43, "end_char": 50}
                 ]
             },
             "output": {
                 "events": [
                     {
-                        "event_type": "military_action",
-                        "trigger": {"text": "launched", "start_char": 17, "end_char": 25},
+                        "event_type": "military_conflict",
+                        "trigger": {"text": "counteroffensive", "start_char": 20, "end_char": 36},
                         "arguments": [
                             {"argument_role": "agent", "entity": {
                                 "text": "Ukrainian forces", "type": "NORP", "start_char": 0, "end_char": 16}},
-                            {"argument_role": "action_target", "entity": {
-                                "text": "counteroffensive", "type": "MISC", "start_char": 27, "end_char": 43}},
                             {"argument_role": "location", "entity": {
-                                "text": "Kharkiv", "type": "LOC", "start_char": 38, "end_char": 45}}
+                                "text": "near Kharkiv", "type": "LOC", "start_char": 37, "end_char": 49}}
                         ],
-                        "metadata": {"sentiment": "neutral", "causality": "Forces initiated a counterattack."}
-                    },
+                        "metadata": {"sentiment": "neutral", "causality": "The counteroffensive led to the reclamation of villages."}
+                    }
+                ],
+                "extracted_entities": [
+                    {"text": "Ukrainian forces", "type": "NORP",
+                        "start_char": 0, "end_char": 16},
+                    {"text": "Kharkiv", "type": "LOC",
+                        "start_char": 43, "end_char": 50}
+                ],
+                "extracted_soa_triplets": [
+                    {"subject": {"text": "Ukrainian forces", "start_char": 0, "end_char": 16},
+                     "action": {"text": "launched", "start_char": 17, "end_char": 25},
+                     "object": {"text": "counteroffensive", "start_char": 26, "end_char": 42}}
+                ]
+            }
+        },
+        {
+            "input": {
+                "text": "The Central Bank of Europe announced a 25 basis point interest rate hike, leading to a surge in bond yields.",
+                "ner_entities": [
+                    {"text": "Central Bank of Europe", "type": "ORG",
+                        "start_char": 4, "end_char": 26},
+                    {"text": "25 basis point", "type": "CARDINAL",
+                        "start_char": 39, "end_char": 53}
+                ]
+            },
+            "output": {
+                "events": [
                     {
-                        "event_type": "territory_change",
-                        "trigger": {"text": "reclaiming", "start_char": 53, "end_char": 63},
+                        "event_type": "economic_policy",
+                        "trigger": {"text": "announced", "start_char": 27, "end_char": 36},
                         "arguments": [
                             {"argument_role": "agent", "entity": {
-                                "text": "Ukrainian forces", "type": "NORP", "start_char": 0, "end_char": 16}},
-                            {"argument_role": "territory", "entity": {
-                                "text": "villages", "type": "LOC", "start_char": 64, "end_char": 72}}
+                                "text": "The Central Bank of Europe", "type": "ORG", "start_char": 0, "end_char": 26}},
+                            {"argument_role": "change", "entity": {
+                                "text": "interest rate hike", "type": "OTHER", "start_char": 54, "end_char": 72}}
                         ],
-                        "metadata": {"sentiment": "positive", "causality": "Counteroffensive led to territory recovery."}
+                        "metadata": {"sentiment": "neutral", "causality": "The interest rate hike caused a surge in bond yields."}
                     }
                 ],
                 "extracted_entities": [
-                    {"text": "Ukrainian", "type": "NORP",
-                        "start_char": 0, "end_char": 9},
-                    {"text": "Kharkiv", "type": "LOC",
-                        "start_char": 38, "end_char": 45},
-                    {"text": "villages", "type": "LOC",
-                        "start_char": 64, "end_char": 72}
+                    {"text": "The Central Bank of Europe",
+                        "type": "ORG", "start_char": 0, "end_char": 26},
+                    {"text": "25 basis point", "type": "CARDINAL",
+                        "start_char": 39, "end_char": 53}
                 ],
                 "extracted_soa_triplets": [
-                    {"subject": {"text": "Ukrainian forces", "start_char": 0, "end_char": 16}, "action": {"text": "launched",
-                                                                                                          "start_char": 17, "end_char": 25}, "object": {"text": "counteroffensive", "start_char": 27, "end_char": 43}},
-                    {"subject": {"text": "Ukrainian forces", "start_char": 0, "end_char": 16}, "action": {
-                        "text": "reclaiming", "start_char": 53, "end_char": 63}, "object": {"text": "villages", "start_char": 64, "end_char": 72}}
-                ],
-                "original_text": "Ukrainian forces launched a counteroffensive near Kharkiv, reclaiming several villages."
-            }
-        },
-        {
-            "input": {
-                "text": "The Parliament debated the new climate bill, facing strong opposition from conservative parties.",
-                "ner_entities": [
-                    {"text": "Parliament", "type": "ORG",
-                        "start_char": 4, "end_char": 14},
-                    {"text": "climate bill", "type": "MISC",
-                        "start_char": 30, "end_char": 42},
-                    {"text": "conservative parties", "type": "ORG",
-                        "start_char": 71, "end_char": 91}
-                ],
-                "soa_triplets": [
-                    {"subject": {"text": "The Parliament", "start_char": 0, "end_char": 14}, "action": {"text": "debated",
-                                                                                                        "start_char": 15, "end_char": 22}, "object": {"text": "the new climate bill", "start_char": 23, "end_char": 42}},
-                    {"subject": {"text": "conservative parties", "start_char": 71, "end_char": 91}, "action": {"text": "facing",
-                                                                                                               "start_char": 44, "end_char": 50}, "object": {"text": "strong opposition", "start_char": 51, "end_char": 68}}
+                    {"subject": {"text": "The Central Bank of Europe", "start_char": 0, "end_char": 26},
+                     "action": {"text": "announced", "start_char": 27, "end_char": 36},
+                     "object": {"text": "a 25 basis point interest rate hike", "start_char": 37, "end_char": 72}}
                 ]
-            },
-            "output": {
-                "events": [
-                    {
-                        "event_type": "legislative_process",
-                        "trigger": {"text": "debated", "start_char": 15, "end_char": 22},
-                        "arguments": [
-                            {"argument_role": "actor", "entity": {
-                                "text": "Parliament", "type": "ORG", "start_char": 4, "end_char": 14}},
-                            {"argument_role": "subject", "entity": {
-                                "text": "climate bill", "type": "MISC", "start_char": 30, "end_char": 42}}
-                        ],
-                        "metadata": {"sentiment": "neutral", "causality": "Parliament engaged in discussion about the bill."}
-                    },
-                    {
-                        "event_type": "political_opposition",
-                        "trigger": {"text": "facing", "start_char": 44, "end_char": 50},
-                        "arguments": [
-                            {"argument_role": "actor", "entity": {
-                                "text": "conservative parties", "type": "ORG", "start_char": 71, "end_char": 91}},
-                            {"argument_role": "opposition_target", "entity": {
-                                "text": "climate bill", "type": "MISC", "start_char": 30, "end_char": 42}}
-                        ],
-                        "metadata": {"sentiment": "negative", "causality": "The bill's content led to strong disagreement."}
-                    }
-                ],
-                "extracted_entities": [
-                    {"text": "Parliament", "type": "ORG",
-                        "start_char": 4, "end_char": 14},
-                    {"text": "climate bill", "type": "MISC",
-                        "start_char": 30, "end_char": 42},
-                    {"text": "conservative parties", "type": "ORG",
-                        "start_char": 71, "end_char": 91}
-                ],
-                "extracted_soa_triplets": [
-                    {"subject": {"text": "The Parliament", "start_char": 0, "end_char": 14}, "action": {"text": "debated",
-                                                                                                        "start_char": 15, "end_char": 22}, "object": {"text": "the new climate bill", "start_char": 23, "end_char": 42}},
-                    {"subject": {"text": "conservative parties", "start_char": 71, "end_char": 91}, "action": {"text": "facing",
-                                                                                                               "start_char": 44, "end_char": 50}, "object": {"text": "strong opposition", "start_char": 51, "end_char": 68}}
-                ],
-                "original_text": "The Parliament debated the new climate bill, facing strong opposition from conservative parties."
-            }
-        },
-        {
-            "input": {
-                "text": "Global stock markets reacted negatively to the central bank's interest rate hike, causing a sharp decline.",
-                "ner_entities": [
-                    {"text": "Global stock markets", "type": "ORG",
-                        "start_char": 0, "end_char": 20},
-                    {"text": "central bank", "type": "ORG",
-                        "start_char": 40, "end_char": 52},
-                    {"text": "interest rate hike", "type": "MISC",
-                        "start_char": 55, "end_char": 73}
-                ],
-                "soa_triplets": [
-                    {"subject": {"text": "Global stock markets", "start_char": 0, "end_char": 20}, "action": {
-                        "text": "reacted", "start_char": 21, "end_char": 28}, "object": {"text": "negatively", "start_char": 29, "end_char": 39}},
-                    {"subject": {"text": "interest rate hike", "start_char": 55, "end_char": 73}, "action": {"text": "causing",
-                                                                                                             "start_char": 75, "end_char": 82}, "object": {"text": "a sharp decline", "start_char": 83, "end_char": 98}}
-                ]
-            },
-            "output": {
-                "events": [
-                    {
-                        "event_type": "market_reaction",
-                        "trigger": {"text": "reacted", "start_char": 21, "end_char": 28},
-                        "arguments": [
-                            {"argument_role": "actor", "entity": {
-                                "text": "Global stock markets", "type": "ORG", "start_char": 0, "end_char": 20}},
-                            {"argument_role": "cause", "entity": {
-                                "text": "interest rate hike", "type": "MISC", "start_char": 55, "end_char": 73}}
-                        ],
-                        "metadata": {"sentiment": "negative", "causality": "Interest rate hike caused market reaction."}
-                    },
-                    {
-                        "event_type": "economic_change",
-                        "trigger": {"text": "decline", "start_char": 91, "end_char": 98},
-                        "arguments": [
-                            {"argument_role": "cause", "entity": {
-                                "text": "interest rate hike", "type": "MISC", "start_char": 55, "end_char": 73}},
-                            {"argument_role": "effect", "entity": {
-                                "text": "sharp decline", "type": "MISC", "start_char": 83, "end_char": 98}}
-                        ],
-                        "metadata": {"sentiment": "negative", "causality": "The hike directly led to the decline."}
-                    }
-                ],
-                "extracted_entities": [
-                    {"text": "Global stock markets", "type": "ORG",
-                        "start_char": 0, "end_char": 20},
-                    {"text": "central bank", "type": "ORG",
-                        "start_char": 40, "end_char": 52},
-                    {"text": "interest rate hike", "type": "MISC",
-                        "start_char": 55, "end_char": 73}
-                ],
-                "extracted_soa_triplets": [
-                    {"subject": {"text": "Global stock markets", "start_char": 0, "end_char": 20}, "action": {
-                        "text": "reacted", "start_char": 21, "end_char": 28}, "object": {"text": "negatively", "start_char": 29, "end_char": 39}},
-                    {"subject": {"text": "interest rate hike", "start_char": 55, "end_char": 73}, "action": {"text": "causing",
-                                                                                                             "start_char": 75, "end_char": 82}, "object": {"text": "a sharp decline", "start_char": 83, "end_char": 98}}
-                ],
-                "original_text": "Global stock markets reacted negatively to the central bank's interest rate hike, causing a sharp decline."
-            }
-        },
-        {
-            "input": {
-                "text": "The new sci-fi movie starring Anya Taylor-Joy received rave reviews from critics and fans alike.",
-                "ner_entities": [
-                    {"text": "Anya Taylor-Joy", "type": "PERSON",
-                        "start_char": 23, "end_char": 38},
-                    {"text": "critics", "type": "PERSON",
-                        "start_char": 60, "end_char": 67},
-                    {"text": "fans", "type": "PERSON",
-                        "start_char": 72, "end_char": 76}
-                ],
-                "soa_triplets": [
-                    {"subject": {"text": "The new sci-fi movie", "start_char": 0, "end_char": 20}, "action": {"text": "received",
-                                                                                                              "start_char": 39, "end_char": 47}, "object": {"text": "rave reviews", "start_char": 48, "end_char": 60}}
-                ]
-            },
-            "output": {
-                "events": [
-                    {
-                        "event_type": "media_release",
-                        # Implied trigger for release
-                        "trigger": {"text": "movie", "start_char": 12, "end_char": 17},
-                        "arguments": [
-                            {"argument_role": "product", "entity": {
-                                "text": "sci-fi movie", "type": "WORK_OF_ART", "start_char": 8, "end_char": 20}},
-                            {"argument_role": "actor", "entity": {
-                                "text": "Anya Taylor-Joy", "type": "PERSON", "start_char": 23, "end_char": 38}}
-                        ],
-                        "metadata": {"sentiment": "neutral", "causality": "The movie was released to the public."}
-                    },
-                    {
-                        "event_type": "reception",
-                        "trigger": {"text": "received", "start_char": 39, "end_char": 47},
-                        "arguments": [
-                            {"argument_role": "subject", "entity": {
-                                "text": "sci-fi movie", "type": "WORK_OF_ART", "start_char": 8, "end_char": 20}},
-                            {"argument_role": "reviewer", "entity": {
-                                "text": "critics", "type": "PERSON", "start_char": 60, "end_char": 67}},
-                            {"argument_role": "reviewer", "entity": {
-                                "text": "fans", "type": "PERSON", "start_char": 72, "end_char": 76}}
-                        ],
-                        "metadata": {"sentiment": "positive", "causality": "The movie's quality led to positive reviews."}
-                    }
-                ],
-                "extracted_entities": [
-                    {"text": "Anya Taylor-Joy", "type": "PERSON",
-                        "start_char": 23, "end_char": 38},
-                    {"text": "critics", "type": "PERSON",
-                        "start_char": 60, "end_char": 67},
-                    {"text": "fans", "type": "PERSON",
-                        "start_char": 72, "end_char": 76}
-                ],
-                "extracted_soa_triplets": [
-                    {"subject": {"text": "The new sci-fi movie", "start_char": 0, "end_char": 20}, "action": {"text": "received",
-                                                                                                              "start_char": 39, "end_char": 47}, "object": {"text": "rave reviews", "start_char": 48, "end_char": 60}}
-                ],
-                "original_text": "The new sci-fi movie starring Anya Taylor-Joy received rave reviews from critics and fans alike."
             }
         }
     ]
 
-    def __new__(cls):
+    def __new__(cls, *args, **kwargs):
         """
-        Ensures only one instance of the model is loaded.
+        Ensures a single instance of EventLLMModel is created (Singleton pattern).
         """
         if cls._instance is None:
             cls._instance = super(EventLLMModel, cls).__new__(cls)
-            cls._instance._load_model()
+            cls._instance._init_model()
         return cls._instance
 
-    def _load_model(self):
-        """
-        Loads the pre-trained language model and tokenizer based on configurations.
-        Supports GPU loading with 4-bit/8-bit quantization for memory efficiency.
-        """
-        settings = ConfigManager.get_settings().event_llm_service
-        general_settings = ConfigManager.get_settings().general
-
-        model_name = settings.model_name
-        model_path = settings.model_path
-        cache_dir = settings.model_cache_dir
-        gpu_enabled = general_settings.gpu_enabled
-
-        self.device = "cuda" if torch.cuda.is_available() and gpu_enabled else "cpu"
-        logger.info(
-            f"Loading Event LLM model: {model_name} to device: {self.device} from path/cache: {model_path}")
-
+    def _init_model(self):
+        """Initializes the LLM model and tokenizer."""
         try:
-            # Initialize tokenizer
+            # FIX: Correctly access the settings from the ConfigManager singleton
+            model_config = ConfigManager.get_settings().event_llm_service
+            general_config = ConfigManager.get_settings().general  # Get GPU flag
+
+            logger.info("Loading model and tokenizer...")
+            self.model_name = model_config.model_name
+            self.model_path = model_config.model_path
+            self.max_new_tokens = model_config.max_new_tokens
+            self.temperature = model_config.temperature
+            self.top_p = model_config.top_p
+            self.generation_max_retries = model_config.generation_max_retries
+            self.generation_retry_delay_seconds = model_config.generation_retry_delay_seconds
+            # FIX: Initialize chunking parameters from config
+            self.chunk_size_tokens = model_config.chunk_size_tokens
+            self.overlap_size_tokens = model_config.overlap_size_tokens
+
+            # --- Load Tokenizer and Model (Using public attributes for API compatibility) ---
+
+            # FIX: Use use_fast=False to mitigate OverflowError/compatibility issues with fast tokenizers
             self.tokenizer = AutoTokenizer.from_pretrained(
-                model_name, cache_dir=cache_dir)
-            logger.info("Tokenizer loaded successfully.")
+                self.model_name,
+                cache_dir=model_config.model_cache_dir,
+                use_fast=False  # Enforce slow tokenizer for robustness against OverflowError/protobuf issues
+            )
 
-            # Check for GPU and attempt quantization
-            if self.device == "cuda":
-                logger.info(
-                    "CUDA is available. Attempting GPU model loading with quantization.")
-                try:
-                    logger.info(
-                        "Attempting LLM model load with 4-bit quantization.")
-                    quantization_config_4bit = BitsAndBytesConfig(
-                        load_in_4bit=True,
-                        # Recommended for better performance with 4-bit
-                        bnb_4bit_compute_dtype=torch.float16
-                    )
-                    self.model = AutoModelForCausalLM.from_pretrained(
-                        model_name,
-                        quantization_config=quantization_config_4bit,
-                        cache_dir=cache_dir,
-                        torch_dtype=torch.float16  # Ensure FP16 for 4-bit
-                    )
-                    logger.info("LLM model loaded with 4-bit quantization.")
-                except Exception as e_4bit:
-                    logger.warning(
-                        f"Could not load LLM with 4-bit quantization ({e_4bit}). Falling back to 8-bit.")
-                    try:
-                        logger.info(
-                            "Attempting LLM model load with 8-bit quantization.")
-                        quantization_config_8bit = BitsAndBytesConfig(
-                            load_in_8bit=True)
-                        self.model = AutoModelForCausalLM.from_pretrained(
-                            model_name,
-                            quantization_config=quantization_config_8bit,
-                            cache_dir=cache_dir
-                        )
-                        logger.info(
-                            "LLM model loaded with 8-bit quantization.")
-                    except Exception as e_8bit:
-                        logger.warning(
-                            f"Could not load LLM with 8-bit quantization ({e_8bit}). Falling back to full precision (FP16 if possible).")
-                        logger.info(
-                            "Attempting LLM model load in full precision (FP16 if CUDA, else FP32).")
-                        self.model = AutoModelForCausalLM.from_pretrained(
-                            model_name,
-                            cache_dir=cache_dir,
-                            # Use FP16 for CUDA, default for CPU
-                            torch_dtype=torch.float16 if self.device == 'cuda' else None
-                        ).to(self.device)
-                        logger.info(
-                            f"LLM model loaded in full precision on {self.device}.")
-            else:
-                # Load model without quantization for CPU or if GPU is disabled/unavailable
-                logger.info(
-                    "CUDA not available or disabled. Loading LLM model on CPU in full precision.")
+            if torch.cuda.is_available() and general_config.gpu_enabled:
+                bnb_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_compute_dtype=torch.bfloat16
+                )
                 self.model = AutoModelForCausalLM.from_pretrained(
-                    model_name, cache_dir=cache_dir).to(self.device)
+                    self.model_name,
+                    quantization_config=bnb_config,
+                    device_map="auto",
+                    cache_dir=model_config.model_cache_dir,
+                )
+            else:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_name,
+                    cache_dir=model_config.model_cache_dir,
+                )
 
-            self.model.eval()  # Set model to evaluation mode for inference
-            logger.info("Event LLM model loaded successfully.")
+            # Ensure padding token is set
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+
+            logger.info(f"Model {self.model_name} loaded successfully.")
+
         except Exception as e:
-            logger.error(
-                f"Failed to load Event LLM model {model_name}: {e}", exc_info=True)
+            logger.error(f"Error initializing LLM model: {e}", exc_info=True)
+            # CRITICAL FIX: Ensure the model/tokenizer are explicitly set to None
+            # so subsequent calls fail fast and correctly.
+            self.model = None
+            self.tokenizer = None
+            raise  # Re-raise to ensure the service startup failure is logged and handled
+
+    def _get_prompt(self, input_data: EventLLMInput, mode: str = "chunk", aggregated_response: Optional[EventLLMGenerateResponse] = None) -> str:
+        """
+        Generates a structured few-shot prompt for the LLM.
+        The prompt's instructions adapt based on the 'mode' ('chunk' or 'synthesis').
+        """
+        # CRITICAL CHECK: Ensure LLM is loaded before generating prompt
+        if self.model is None or self.tokenizer is None:
+            raise RuntimeError("LLM model or tokenizer is not initialized.")
+
+        if mode == "chunk":
+            system_instruction = (
+                "You are an expert event extraction and entity recognition system. Your task is to analyze the provided text and "
+                "extract all relevant events and entities based strictly on the content of the text. "
+                "You must respond with a single, valid JSON object that adheres to the Pydantic schema for `EventLLMGenerateResponse`.\n\n"
+                "Key rules:\n"
+                "1.  **NO HALLUCINATION:** Only extract information explicitly mentioned in the text.\n"
+                "2.  **STRICT JSON FORMAT:** The response must be a single JSON object matching the schema `EventLLMGenerateResponse`.\n"
+                "3.  **ACCURATE OFFSETS:** Ensure all character offsets (`start_char`, `end_char`) are precise and correct.\n"
+                "4.  **RELEVANT INFORMATION ONLY:** Do not include any information not present in the text.\n"
+                "5.  **EVENT TYPES:** Identify common event types like 'travel', 'earthquake', 'policy_change', 'military_conflict', etc.\n\n"
+            )
+            # Few-shot examples for chunk-level extraction
+            examples_prompt = ""
+            for example in self._DIVERSE_EXAMPLES:
+                examples_prompt += f"Input:\n{json.dumps(example['input'], indent=2)}\n\n"
+                examples_prompt += f"Output:\n{json.dumps(example['output'], indent=2)}\n\n"
+            user_input_prompt = f"Input:\n{json.dumps(input_data.dict(exclude={'events', 'extracted_entities', 'extracted_soa_triplets'}), indent=2)}\n\nOutput:\n"
+            return system_instruction + examples_prompt + user_input_prompt
+
+        elif mode == "synthesis" and aggregated_response is not None:
+            # The synthesis prompt
+            synthesis_instruction = (
+                "You are a sophisticated document summarization and event synthesis engine. Your task is to review the following "
+                "aggregated data (low-level events and entities) and identify the **1 to 3 single, most significant main events** and **key entities** "
+                "that define the core narrative. You must synthesize the result into a single, valid JSON object matching the `EventLLMGenerateResponse` schema. "
+                "DO NOT include the original document text in the input to save tokens. \n\n"
+                "Key rules:\n"
+                "1. **HIGH-LEVEL SYNTHESIS:** Your output must represent the main narrative (1-3 events MAX).\n"
+                "2. **STRICT JSON FORMAT:** The response must be a single JSON object matching the schema.\n"
+                "3. **ACCURATE OFFSETS:** Retain original character offsets relative to the initial long document.\n"
+                "4. **SOA TRIPLETS:** Omit extracted_soa_triplets from your final synthesized output.\n\n"
+            )
+
+            # FIX: Only pass aggregated data, NOT the entire original document text
+            synthesis_data_for_llm = {
+                "Extracted_Low_Level_Events": [e.dict() for e in aggregated_response.events],
+                "Extracted_Entities": [e.dict() for e in aggregated_response.extracted_entities],
+            }
+            user_input_prompt = f"Review Data:\n{json.dumps(synthesis_data_for_llm, indent=2)}\n\nSynthesized Output (Events and Key Entities ONLY):\n"
+            return synthesis_instruction + user_input_prompt
+
+        else:
+            raise ValueError(f"Invalid mode: {mode}")
+
+    def _call_llm(self, prompt: str) -> str:
+        """
+        Calls the LLM with the generated prompt and returns the raw text response.
+        This version is more robust in handling different output formats.
+        """
+        # CRITICAL CHECK: Ensure LLM is loaded before calling
+        if self.model is None or self.tokenizer is None:
             raise RuntimeError(
-                f"Could not load Event LLM model {model_name}") from e
+                "LLM model or tokenizer is not initialized. Cannot call LLM.")
 
-    def _create_prompt(self, data: EventLLMInput, attempt_num: int = 1) -> str:
-        """Helper function to construct the LLM prompt, with optional retry message and diverse examples."""
-        stricter_instructions = [
-            "",  # Base prompt for the first attempt
-            "\n\n--- PREVIOUS ATTEMPT FAILED ---\n"
-            "Your last response was not valid JSON or was not correctly formatted. You MUST try again.\n"
-            "Carefully follow the instructions: Your ENTIRE response MUST be a single, complete, and valid JSON object, *enclosed within ```json and ``` markdown fences*. "
-            "DO NOT include any text before or after the JSON, and DO NOT wrap it in additional markdown code fences or conversational phrases.\n"
-            "--- END OF WARNING ---\n\n",
-            "\n\n--- SECOND FAILED ATTEMPT ---\n"
-            "URGENT: Your last two attempts failed to produce valid JSON or failed to enclose it correctly. You MUST provide a JSON object that is parsable according to the schema, with no additional text, and *EXACTLY within ```json and ``` fences*. THIS IS YOUR FINAL ATTEMPT. ENSURE VALID JSON.\n"
-            "--- END OF WARNING ---\n\n"
-        ]
-        retry_message = stricter_instructions[min(
-            attempt_num - 1, len(stricter_instructions) - 1)]
+        inputs = self.tokenizer(
+            prompt, return_tensors="pt", max_length=self.tokenizer.model_max_length, truncation=True).to(self.model.device)
+        output = self.model.generate(
+            **inputs,
+            max_new_tokens=self.max_new_tokens,
+            do_sample=False,  # Use deterministic generation for IE
+            temperature=self.temperature,
+            top_p=self.top_p,
+            pad_token_id=self.tokenizer.eos_token_id
+        )
+        response_text = self.tokenizer.decode(
+            output[0], skip_special_tokens=True)
 
-        # Build the few-shot examples part of the prompt
-        examples_prompt_section = ""
-        for i, example in enumerate(self._DIVERSE_EXAMPLES):
-            example_input = example["input"]
-            example_output_json_str = json.dumps(example["output"], indent=2)
+        # --- FINAL FIX: Universal JSON Block Extraction ---
 
-            examples_prompt_section += f"""
---- EXAMPLE {i+1} ---
-Input Text: {example_input["text"].strip()}
-Named Entities:
-{chr(10).join([f"- {e['text'].strip()} ({e['type'].strip()})" for e in example_input["ner_entities"]]).strip()}
-Subject-Object-Action Triplets:
-{chr(10).join([f"- ({t['subject']['text'].strip()}, {t['action']['text'].strip()}, {t['object']['text'].strip() if t['object'] else 'N/A'})" for t in example_input["soa_triplets"]]).strip()}
+        # 1. Search for JSON block surrounded by triple backticks (most reliable for clean output)
+        json_match = re.search(
+            r'```json\s*(\{.*?\})\s*```', response_text, re.DOTALL)
+        if json_match:
+            return json_match.group(1).strip()
 
-JSON Output Example (strictly follow this structure and include the fences):
-```json
-{example_output_json_str}
-```
-"""
-        # Strip to remove initial/final newlines/spaces from the entire examples section
-        examples_prompt_section = examples_prompt_section.strip()
+        # 2. Isolate the prediction area using the final delimiter 'Output:\n'
+        output_delimiter = "Output:\n"
+        last_output_index = response_text.rfind(output_delimiter)
 
-        # Construct the main prompt with instructions and examples
-        base_prompt = f"""
-Extract events and entities from the following text, using the provided Named Entities and Subject-Object-Action triplets as context.
-Synthesize additional event-related metadata (e.g., time, location, sentiment, causality).
+        search_text = response_text
+        if last_output_index != -1:
+            # If the delimiter is found, search only the content after it
+            search_text = response_text[last_output_index +
+                                        len(output_delimiter):].strip()
 
-YOUR ENTIRE RESPONSE MUST BE A SINGLE, VALID JSON OBJECT.
-IT MUST STRICTLY ADHERE TO THE EventLLMGenerateResponse JSON SCHEMA.
-DO NOT INCLUDE ANY TEXT BEFORE OR AFTER THE JSON OBJECT.
-DO NOT INCLUDE ANY EXPLANATIONS OR CONVERSATIONAL PHRASES.
-YOUR JSON OUTPUT *MUST* BE ENCLOSED WITHIN ```json AND ``` MARKDOWN FENCES.
+        # 3. Use the bracket counting function to extract the first complete top-level JSON block
+        clean_json_str = _extract_first_json_block(search_text)
 
-{examples_prompt_section}
+        if clean_json_str:
+            return clean_json_str  # Already parsed and canonized inside _extract_first_json_block
 
---- YOUR TASK ---
-Input Text: {data.text.strip()}
-Named Entities:
-{chr(10).join([f"- {e.text.strip()} ({e.type.strip()})" for e in data.ner_entities]).strip()}
-Subject-Object-Action Triplets:
-{chr(10).join([f"- ({t.subject.text.strip()}, {t.action.text.strip()}, {t.object.text.strip() if t.object else 'N/A'})" for t in data.soa_triplets]).strip()}
+        # 4. Final Fallback (Grab the cleanest JSON structure, whether it parses or not)
+        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if json_match:
+            return json_match.group(0).strip()
 
-JSON Output (strictly follow the examples and schema, and include the fences):
-```json
-""".strip()  # Strip the entire base_prompt to remove initial/final newlines/spaces
-
-        return retry_message.strip() + base_prompt
-
-    def _parse_llm_output(self, generated_text: str) -> EventLLMGenerateResponse:
-        """
-        Extracts and validates the JSON object from the LLM's raw output.
-        This function is made more robust to handle cases where the LLM might echo the prompt
-        or include other conversational text. It will search the entire output for JSON
-        and prioritize the last valid JSON object found.
-        """
-        logger.debug("Starting robust JSON extraction from LLM output.")
-        logger.debug(
-            f"Raw text received by _parse_llm_output (first 2000 chars): \n{generated_text[:2000]}...")
-
-        extracted_response = None
-
-        # Updated regex to explicitly look for JSON within ```json ... ``` fences
-        # This makes the parsing more robust against prompt echoing.
-        json_pattern = re.compile(r'```json(.*?)```', re.DOTALL)
-
-        # Find all potential JSON matches in the *entire* generated text.
-        all_json_candidates_raw = json_pattern.findall(generated_text)
-        logger.debug(
-            f"Found {len(all_json_candidates_raw)} potential JSON candidates (within ```json fences).")
-
-        # Fallback if no fenced JSON is found, try to find any JSON object
-        if not all_json_candidates_raw:
-            logger.warning(
-                "No JSON found within ```json fences. Attempting to find any top-level JSON object.")
-            # Fallback regex to find any string that starts with '{' and ends with '}'
-            json_pattern_fallback = re.compile(r'(\{.*?})', re.DOTALL)
-            all_json_candidates_raw = json_pattern_fallback.findall(
-                generated_text)
-            logger.debug(
-                f"Found {len(all_json_candidates_raw)} potential JSON candidates (fallback).")
-
-        # Iterate from the last match to the first, as the actual LLM output is most likely the last valid JSON.
-        for i, json_str_candidate in enumerate(reversed(all_json_candidates_raw)):
-            candidate_index = len(all_json_candidates_raw) - 1 - i
-            logger.debug(
-                f"Attempting to parse candidate JSON string #{candidate_index} (first 500 chars): \n{json_str_candidate[:500]}..."
-            )
-
-            try:
-                # .strip() to remove leading/trailing whitespace
-                parsed_dict = json.loads(json_str_candidate.strip())
-                logger.debug(
-                    f"Candidate JSON string #{candidate_index} successfully parsed into dictionary.")
-
-                # If JSON parsing is successful, attempt Pydantic validation
-                response_data = EventLLMGenerateResponse.parse_obj(
-                    parsed_dict)
-                extracted_response = response_data
-                logger.info(
-                    f"Successfully extracted and validated a JSON response from candidate #{candidate_index}."
-                )
-                break  # Found a valid response, stop searching
-            except json.JSONDecodeError as e:
-                logger.debug(
-                    f"Candidate JSON string #{candidate_index} parsing failed: {e}. Trying next candidate."
-                )
-            except ValidationError as e:
-                logger.debug(
-                    f"Candidate JSON string #{candidate_index} failed Pydantic validation: {e}. Trying next candidate."
-                )
-            except Exception as e:
-                logger.debug(
-                    f"Candidate JSON string #{candidate_index} failed with unexpected error: {e}. Trying next candidate."
-                )
-
-        # If no valid JSON was extracted after trying all candidates
-        if extracted_response is None:
-            logger.error(
-                f"LLM output did not contain a parsable and valid JSON structure for text: '{data.text[:100]}...'. "
-                f"No valid JSON found after checking {len(all_json_candidates_raw)} candidates. "
-                f"Full raw output that caused failure (first 2000 chars): {generated_text[:2000]}..."
-            )
-            raise ValueError(
-                "LLM did not generate a recognizable and valid JSON output."
-            )
-
-        return extracted_response
+        return response_text.strip()
 
     @retry(
         stop=stop_after_attempt(ConfigManager.get_settings(
-        ).event_llm_service.generation_max_retries + 1),
-        wait=wait_exponential(
-            multiplier=1,
-            min=ConfigManager.get_settings().event_llm_service.generation_retry_delay_seconds,
-            max=ConfigManager.get_settings().event_llm_service.generation_retry_delay_seconds * 5
-        ),
-        retry=(retry_if_exception_type(
-            (json.JSONDecodeError, ValidationError, ValueError, torch.cuda.OutOfMemoryError, RuntimeError))),
+        ).event_llm_service.generation_max_retries),
+        wait=wait_exponential(multiplier=1, min=ConfigManager.get_settings(
+        ).event_llm_service.generation_retry_delay_seconds, max=10),
+        # Retry on both ValidationError and our custom error
+        retry=retry_if_exception_type((ValidationError, LLMGenerationError)),
         before_sleep=before_sleep_log(logger, logging.WARNING),
-        reraise=True
     )
-    def _attempt_generation_and_parsing(self, data: EventLLMInput, retry_state: Optional[RetryCallState] = None) -> EventLLMGenerateResponse:
+    def _generate_response_for_chunk(self, input_data: EventLLMInput) -> EventLLMGenerateResponse:
         """
-        A single attempt to generate and parse. Decorated by tenacity.
-        'retry_state' is automatically provided by tenacity during retries, and is None for the first attempt.
+        Generates events and entities for a SINGLE text chunk.
+        This method is now a private helper with retry logic.
         """
-        attempt_num = retry_state.attempt_number if retry_state else 1
-        logger.debug(f"Starting LLM generation attempt #{attempt_num}.")
-
-        prompt = self._create_prompt(data, attempt_num=attempt_num)
-        logger.debug(f"LLM Input Prompt (Attempt #{attempt_num}): \n{prompt}")
-
-        settings = ConfigManager.get_settings().event_llm_service
-
-        input_ids = self.tokenizer(
-            prompt, return_tensors="pt").input_ids.to(self.device)
-        logger.debug(
-            f"Input IDs shape: {input_ids.shape}, device: {input_ids.device}")
-
-        import time
-        start_inference_time = time.time()
-
-        if self.device == 'cuda':
-            torch.cuda.empty_cache()
-            logger.debug(
-                f"CUDA Memory Summary BEFORE inference (Attempt #{attempt_num}):\n{torch.cuda.memory_summary()}")
-
+        raw_response = ""
         try:
-            with torch.no_grad():
-                output_tokens = self.model.generate(
-                    input_ids,
-                    max_new_tokens=settings.max_new_tokens,
-                    temperature=settings.temperature,
-                    top_p=settings.top_p,
-                    num_beams=1,
-                    do_sample=True if settings.temperature > 0.0 else False,
-                    pad_token_id=self.tokenizer.eos_token_id
-                )
-            end_inference_time = time.time()
+            prompt = self._get_prompt(input_data, mode="chunk")
             logger.info(
-                f"LLM inference completed in {end_inference_time - start_inference_time:.2f} seconds.")
+                f"Generating response for input chunk: {input_data.text[:100]}...")
+            raw_response = self._call_llm(prompt)
 
-            if self.device == 'cuda':
-                logger.debug(
-                    f"CUDA Memory Summary AFTER inference (Attempt #{attempt_num}):\n{torch.cuda.memory_summary()}")
+            # Sanitize response (stripping non-json noise outside the LLM cleanup)
+            raw_response = raw_response.strip().lstrip("```json").rstrip("```").strip()
 
-            logger.debug(f"Output Tokens shape: {output_tokens.shape}")
-            logger.debug(
-                f"Output Tokens snippet (first 50): {output_tokens[0][:50].tolist()}")
+            # Print raw response for debugging purposes (as requested)
+            logger.error(f"Failing raw response (pre-parse): {raw_response}")
 
-        except Exception as e:
-            end_inference_time = time.time()
-            logger.error(
-                f"LLM inference failed during model.generate after {end_inference_time - start_inference_time:.2f} seconds: {e}",
-                exc_info=True
-            )
-            if self.device == 'cuda':
-                logger.error(
-                    f"CUDA Memory Summary ON ERROR (Attempt #{attempt_num}):\n{torch.cuda.memory_summary()}")
+            # FIX: Robust JSON loading
+            try:
+                json_data = json.loads(raw_response)
+            # Catch general parsing errors, including OverflowError and JSONDecodeError sources
+            except Exception as e:
+                # We now raise our custom exception (LLMGenerationError), which is retryable
+                error_msg = f"LLM output parsing failed ({type(e).__name__}: {e})"
+                logger.error(error_msg)
+                raise LLMGenerationError(error_msg) from e
+
+            # --- CRITICAL FIX 2: Apply LLM Output Field Mapping (Predicate -> Action) ---
+            json_data = map_llm_output_fields(json_data)
+
+            # Validate the JSON data against the Pydantic schema
+            response_model = EventLLMGenerateResponse(**json_data)
+            return response_model
+
+        except ValidationError as e:
+            logger.error(f"Validation error for chunk: {e}")
+            logger.error(f"Failing raw response: {raw_response}")
+            # Re-raise existing ValidationError to ensure tenacity retry is triggered
             raise
+        except Exception as e:
+            # This catch is for unexpected errors outside of Validation/JSON decoding
+            error_msg = f"Unexpected fatal runtime error in LLM chunk processing: {type(e).__name__}: {e}"
+            logger.error(error_msg, exc_info=True)
 
-        generated_text = self.tokenizer.decode(
-            output_tokens[0], skip_special_tokens=True)
-        logger.debug(
-            f"LLM Raw Output (Attempt #{attempt_num}, first 2000 chars): \n{generated_text[:2000]}..."
-        )
-        logger.debug(
-            f"Length of raw generated text: {len(generated_text)} characters.")
+            # Since this is a final catch, we assume the parsing issues are frequent and retryable
+            # If it's truly unexpected (like a memory error), tenacity will eventually stop.
+            raise LLMGenerationError(error_msg) from e
 
-        return self._parse_llm_output(generated_text)
-
-    def generate_events(self, data: EventLLMInput) -> EventLLMGenerateResponse:
+    def _chunk_text(self, text: str) -> List[Dict[str, Any]]:
         """
-        Orchestrates the generation of structured event information using the LLM.
-        This method invokes the tenacity-driven retry mechanism through the decorated internal method.
+        Splits a long text into smaller chunks for sequential processing.
+        Uses a sliding window approach with a specified overlap to preserve context.
         """
-        if not hasattr(self.model, 'generate'):
+        # CRITICAL FIX: Check if tokenizer is None due to initialization failure
+        if self.tokenizer is None:
             raise RuntimeError(
-                "LLM model not loaded or not a generative model.")
+                "Tokenizer is None. LLM model initialization failed.")
+
+        tokens = self.tokenizer.encode(text)
+        total_tokens = len(tokens)
+        chunks = []
+
+        # FIX: Get chunk parameters from self (config)
+        max_tokens = self.chunk_size_tokens
+        overlap = self.overlap_size_tokens
+
+        current_position = 0
+        while current_position < total_tokens:
+            end_position = min(current_position + max_tokens, total_tokens)
+            chunk_tokens = tokens[current_position:end_position]
+            chunk_text = self.tokenizer.decode(chunk_tokens)
+
+            # Find the actual character start/end positions in the original text
+            # This is an approximation/fallback for tokenizers that don't map tokens perfectly
+            # For most models, the tokenizer.decode and text.find should work well.
+            start_char = len(self.tokenizer.decode(
+                tokens[:current_position], skip_special_tokens=True))
+            end_char = start_char + len(chunk_text)
+
+            # Re-check actual character offsets in the original text to be safe
+            # Use `text.find` for the first occurrence of the chunk text, starting search after the previous chunk's start.
+            if chunks:
+                search_start = chunks[-1]['end_char_offset'] - overlap
+            else:
+                search_start = 0
+
+            # Use a slightly more robust way to find the actual start in the original string
+            try:
+                # Find where the chunk_text starts in the original text
+                start_char_candidate = text.find(
+                    chunk_text.strip(), search_start)
+                if start_char_candidate != -1 and start_char_candidate >= search_start:
+                    start_char = start_char_candidate
+                    # Adjust end_char based on the found start
+                    end_char = start_char + len(chunk_text.strip())
+            except:
+                # Fallback to token-based offset if string search fails
+                pass
+
+            chunks.append({
+                "text": chunk_text,
+                "start_char_offset": start_char,
+                "end_char_offset": end_char
+            })
+
+            if end_position == total_tokens:
+                break
+            current_position = end_position - overlap
+
+        return chunks
+
+    def _aggregate_results(self, chunked_responses: List[EventLLMGenerateResponse], original_text: str) -> EventLLMGenerateResponse:
+        """
+        Aggregates results from multiple chunks, resolving overlaps and de-duplicating events.
+        It uses a fuzzy matching approach for events and entities to handle minor discrepancies.
+        """
+        aggregated_events = []
+        aggregated_entities = []
+        aggregated_soa_triplets = []  # Keep all SOA triplets, they are low-level details
+
+        seen_event_keys = set()
+        seen_entity_texts = set()
+        seen_soa_keys = set()
+
+        for chunk_response in chunked_responses:
+            # Events aggregation
+            for event in chunk_response.events:
+                # Create a canonical key for de-duplication
+                event_key = (
+                    event.event_type.lower(),
+                    event.trigger.text.lower(),
+                    # Entities are important for de-duping, use a tuple of sorted argument texts
+                    tuple(sorted(arg.entity.text.lower()
+                                 for arg in event.arguments))
+                )
+                if event_key not in seen_event_keys:
+                    # Check for approximate overlap in trigger span to be safer
+                    is_duplicate = False
+                    for existing_event in aggregated_events:
+                        # Simple overlap check: if event types match and triggers overlap significantly
+                        if existing_event.event_type.lower() == event.event_type.lower():
+                            trigger_overlap = min(existing_event.trigger.end_char, event.trigger.end_char) - max(
+                                existing_event.trigger.start_char, event.trigger.start_char)
+                            if trigger_overlap > 0:  # Overlap exists
+                                overlap_ratio = trigger_overlap / \
+                                    min(len(existing_event.trigger.text),
+                                        len(event.trigger.text))
+                                if overlap_ratio > 0.5:  # More than 50% overlap in trigger span
+                                    is_duplicate = True
+                                    break
+
+                    if not is_duplicate:
+                        aggregated_events.append(event)
+                        seen_event_keys.add(event_key)
+
+            # Entities aggregation
+            for entity in chunk_response.extracted_entities:
+                # Use text and type for de-duplication
+                if (entity.text.lower(), entity.type.lower()) not in seen_entity_texts:
+                    aggregated_entities.append(entity)
+                    seen_entity_texts.add(
+                        (entity.text.lower(), entity.type.lower()))
+
+            # SOA triplets aggregation (keep for potential use in synthesis, although prompt says to discard in final output)
+            for soa in chunk_response.extracted_soa_triplets:
+                soa_key = (
+                    soa.subject.text.lower(),
+                    soa.action.text.lower(),
+                    soa.object.text.lower()
+                )
+                if soa_key not in seen_soa_keys:
+                    aggregated_soa_triplets.append(soa)
+                    seen_soa_keys.add(soa_key)
+
+        # Get job_id from the first successful chunk, or generate a new one if the list is empty
+        first_job_id = chunked_responses[0].job_id if chunked_responses and chunked_responses[0].job_id else str(
+            uuid.uuid4())
+
+        return EventLLMGenerateResponse(
+            events=aggregated_events,
+            extracted_entities=aggregated_entities,
+            extracted_soa_triplets=aggregated_soa_triplets,
+            # FIX: Ensure job_id is correctly set (either from a chunk or generated).
+            job_id=first_job_id,
+            # FIX: Ensure original_text is always provided here.
+            original_text=original_text
+        )
+
+    @retry(
+        stop=stop_after_attempt(ConfigManager.get_settings(
+        ).event_llm_service.generation_max_retries),
+        wait=wait_exponential(multiplier=1, min=ConfigManager.get_settings(
+        ).event_llm_service.generation_retry_delay_seconds, max=10),
+        # Retry on both ValidationError and our custom error
+        retry=retry_if_exception_type((ValidationError, LLMGenerationError)),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+    )
+    def _synthesize_main_events(self, original_text: str, aggregated_response: EventLLMGenerateResponse) -> EventLLMGenerateResponse:
+        """
+        Synthesizes main events from the aggregated low-level events.
+        This is the second, high-level pass of the pipeline.
+        """
+        # EventLLMInput is used to pass the aggregated data to the prompt generator
+        synthesis_input = EventLLMInput(
+            text=original_text,
+            ner_entities=[],  # Not strictly needed here, but kept for schema consistency
+            soa_triplets=[],
+            # Pass all aggregated data to the prompt generation
+            events=aggregated_response.events,
+            extracted_entities=aggregated_response.extracted_entities
+        )
+
+        # FIX: Significantly simplify the synthesis prompt by removing the original document text.
+        prompt = self._get_prompt(
+            synthesis_input, mode="synthesis", aggregated_response=aggregated_response)
+        logger.info("Performing main event synthesis...")
+        raw_response = self._call_llm(prompt)
 
         try:
-            return self._attempt_generation_and_parsing(data)
-        except Exception as e:
-            settings = ConfigManager.get_settings().event_llm_service
+            raw_response = raw_response.strip().lstrip("```json").rstrip("```").strip()
+
+            # Use safe JSON loading
+            try:
+                json_data = json.loads(raw_response)
+            except Exception as e:
+                error_msg = f"LLM synthesis output parsing failed ({type(e).__name__}: {e})"
+                logger.error(error_msg)
+
+                # Raise LLMGenerationError to signal tenacity for a retry
+                raise LLMGenerationError(error_msg) from e
+
+            # FIX: Apply field mapping before validation
+            json_data = map_llm_output_fields(json_data)
+
+            # The synthesis pass is only for main events and key entities.
+            # We explicitly *remove* any SOA triplets that the LLM might hallucinate.
+            if "extracted_soa_triplets" in json_data:
+                del json_data["extracted_soa_triplets"]
+
+            # Validate the synthesized JSON
+            synthesized_response = EventLLMGenerateResponse(**json_data)
+
+            # Ensure the synthesized response has the original job_id and text from aggregation pass
+            synthesized_response.job_id = aggregated_response.job_id
+            synthesized_response.original_text = original_text
+
+            # Additional check: ensure max 3 events
+            if len(synthesized_response.events) > 3:
+                logger.warning(
+                    f"Synthesis returned {len(synthesized_response.events)} events. Truncating to 3 main events.")
+                synthesized_response.events = synthesized_response.events[:3]
+
+            return synthesized_response
+
+        except ValidationError as e:
             logger.error(
-                f"LLM output did not produce valid JSON after {settings.generation_max_retries + 1} attempts. Final error: {e}",
-                exc_info=True
+                f"Validation error for synthesis pass: {e}")
+            logger.error(f"Failing raw response: {raw_response}")
+            # Re-raise existing ValidationError to ensure tenacity retry is triggered
+            raise
+        except Exception as e:
+            error_msg = f"Unexpected runtime error in LLM synthesis processing: {type(e).__name__}: {e}"
+            logger.error(error_msg, exc_info=True)
+            # Raise LLMGenerationError to signal tenacity for a retry
+            raise LLMGenerationError(error_msg) from e
+
+    def process_article_in_chunks(self, article_text: str, ner_entities: Optional[List[Entity]] = None) -> EventLLMGenerateResponse:
+        """
+        Main method to process a long article using a two-pass pipeline.
+        It orchestrates the chunking, individual chunk processing, and final synthesis.
+        
+        NOTE: The ner_entities input is now expected to be a list of Pydantic Entity objects, 
+        as received from the EventLLMInput validation layer.
+        """
+        if not article_text:
+            logger.warning("Attempted to process an empty article.")
+            # Ensure we return a valid response even for empty text
+            return EventLLMGenerateResponse(events=[], extracted_entities=[], extracted_soa_triplets=[], job_id=str(uuid.uuid4()), original_text=article_text)
+
+        # CRITICAL CHECK: Ensure LLM is loaded before starting pipeline
+        if self.model is None or self.tokenizer is None:
+            raise RuntimeError(
+                "LLM model is not initialized. Cannot process article.")
+
+        # Pass 1: Chunk-level extraction and aggregation
+        # Parameters retrieved from config/self
+
+        logger.info(
+            f"Initiating two-pass pipeline for article of length {len(article_text)} characters.")
+
+        # FIX: Remove hardcoded chunk parameters
+        chunks = self._chunk_text(article_text)
+        chunked_responses = []
+
+        # Ensure ner_entities is treated as an empty list if None
+        ner_entities = ner_entities if ner_entities is not None else []
+
+        for i, chunk in enumerate(chunks):
+            # Filter NER entities relevant to the current chunk's character span
+            # CRITICAL FIX: Use attribute access (dot notation) instead of subscripting
+            # Pydantic models are passed in, which are not subscriptable.
+            chunk_ner_entities = [
+                entity for entity in ner_entities if
+                entity.start_char >= chunk["start_char_offset"] and
+                entity.end_char <= chunk["end_char_offset"]
+            ]
+
+            # Adjust character offsets of the NER entities to be relative to the *start of the chunk*
+            # CRITICAL FIX: Convert the Pydantic Entity object to a dictionary for the LLM prompt,
+            # as the prompt examples and internal schema conversion expect Dict[str, Any].
+            adjusted_ner_entities = []
+            offset = chunk["start_char_offset"]
+            for entity in chunk_ner_entities:
+                # Use .model_dump() or .dict() to convert Pydantic object to dict
+                adjusted_entity = entity.model_dump()
+                # Offsets for LLM input must be relative to the chunk text
+                adjusted_entity["start_char"] -= offset
+                adjusted_entity["end_char"] -= offset
+                adjusted_ner_entities.append(adjusted_entity)
+
+            chunk_input = EventLLMInput(
+                text=chunk["text"],
+                ner_entities=adjusted_ner_entities
+                # SOA triplets are omitted here, allowed by schema change
             )
-            raise ValueError(
-                "LLM did not generate a recognizable and valid JSON output after multiple attempts.")
+
+            try:
+                # _generate_response_for_chunk has the retry logic baked in
+                chunk_response = self._generate_response_for_chunk(chunk_input)
+
+                # Adjust all character offsets in the response back to the original text's frame
+                # The response object contains Pydantic models, so use attribute access again
+                for event in chunk_response.events:
+                    event.trigger.start_char += offset
+                    event.trigger.end_char += offset
+                    for arg in event.arguments:
+                        arg.entity.start_char += offset
+                        arg.entity.end_char += offset
+                for entity in chunk_response.extracted_entities:
+                    entity.start_char += offset
+                    entity.end_char += offset
+                for soa in chunk_response.extracted_soa_triplets:
+                    soa.subject.start_char += offset
+                    soa.subject.end_char += offset
+                    soa.action.start_char += offset
+                    soa.action.end_char += offset
+                    soa.object.start_char += offset
+                    soa.object.end_char += offset
+
+                chunked_responses.append(chunk_response)
+                logger.info(
+                    f"Successfully processed chunk {i+1}/{len(chunks)}.")
+            except Exception as e:
+                # FIX: More robust logging of error object to avoid "No constructor defined"
+                logger.error(
+                    f"Failed to process chunk {i+1}/{len(chunks)}. Skipping. Error: {type(e).__name__}: {e}", exc_info=True)
+                # Re-raise on chunk failure if needed, but skipping allows aggregation of partial results
+                continue
+
+        # Aggregate the raw results from all chunks
+        aggregated_response = self._aggregate_results(
+            chunked_responses, article_text)
+        logger.info(
+            f"Aggregation complete. Found {len(aggregated_response.events)} low-level events and {len(aggregated_response.extracted_entities)} entities.")
+
+        # Pass 2: Main event synthesis
+        # FINAL FIX: If only one chunk was processed, we bypass the synthesis step
+        # and rely on the Pass 1 aggregation, as the synthesis is redundant and error-prone.
+        if len(chunks) == 1 and len(chunked_responses) == 1:
+            logger.info(
+                "Single chunk processed successfully. Bypassing redundant synthesis step.")
+            # Ensure the aggregated response events are clean for the single-chunk output.
+            # In a true single-chunk scenario, the low-level events ARE the main events.
+            return aggregated_response
+
+        # If all chunks failed, the aggregated response will be empty, skip synthesis
+        if not aggregated_response.events:
+            logger.warning(
+                "No events extracted from any chunk. Skipping synthesis.")
+            return aggregated_response  # Return the empty aggregated response
+
+        # _synthesize_main_events has the retry logic baked in
+        final_response = self._synthesize_main_events(
+            article_text, aggregated_response)
+        logger.info(
+            f"Synthesis complete. Found {len(final_response.events)} main events.")
+
+        return final_response
 
 # src/core/event_llm_logic.py
 # File path: src/core/event_llm_logic.py

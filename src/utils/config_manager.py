@@ -42,6 +42,12 @@ class EventLLMServiceSettings(ServiceSettings):
         3, description="Number of retries for LLM generation if output is invalid.")
     generation_retry_delay_seconds: int = Field(
         2, description="Delay in seconds between generation retries.")
+    # FIX: Add chunking parameters to config
+    chunk_size_tokens: int = Field(
+        2048, description="Max token size for LLM input chunks.")
+    overlap_size_tokens: int = Field(
+        128, description="Token overlap size between consecutive chunks.")
+
 
 
 
@@ -123,6 +129,8 @@ if __name__ == "__main__":
           model_cache_dir: "/tmp/llm"
           generation_max_retries: 3
           generation_retry_delay_seconds: 2
+          chunk_size_tokens: 2048
+          overlap_size_tokens: 128
         orchestrator_service:
           port: 8000
           ner_service_url: "http://localhost:8001"

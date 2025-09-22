@@ -31,7 +31,8 @@ async def process_single_cli(text: str):
                 f"Sending single text (len: {len(text)}) to Orchestrator service: {orchestrator_url}/process-text")
             response = await client.post(
                 f"{orchestrator_url}/process-text",
-                json=ProcessTextRequest(text=text).dict()
+                # FIXED: Use model_dump()
+                json=ProcessTextRequest(text=text).model_dump()
             )
             response.raise_for_status()
             result = response.json()
@@ -124,7 +125,7 @@ async def process_file_cli(input_path: str, output_path: str):
             batch_request = ProcessBatchRequest(texts=texts_only)
             response = await http_client_orchestrator.post(
                 f"{orchestrator_url}/process-batch",
-                json=batch_request.dict()
+                json=batch_request.model_dump()  # FIXED: Use model_dump()
             )
             response.raise_for_status()
             batch_info = response.json()
@@ -162,7 +163,8 @@ async def poll_batch_status(job_id: str, client: httpx.AsyncClient, output_path:
         try:
             response = await client.get(f"{orchestrator_url}/status/{job_id}")
             response.raise_for_status()
-            status_response = BatchJobStatusResponse.parse_obj(response.json())
+            status_response = BatchJobStatusResponse.model_validate(
+                response.json())  # FIXED: Use model_validate
 
             print(
                 f"Job ID: {status_response.job_id}, Status: {status_response.status}", end="")
@@ -178,7 +180,7 @@ async def poll_batch_status(job_id: str, client: httpx.AsyncClient, output_path:
                     with open(output_path, 'w', encoding='utf-8') as f:
                         for res in status_response.results:
                             f.write(json.dumps(
-                                res.dict(), ensure_ascii=False) + '\n')
+                                res.model_dump(), ensure_ascii=False) + '\n')  # FIXED: Use model_dump()
                     print(
                         f"Batch processing completed successfully. Results saved to {output_path}")
                 else:
@@ -274,11 +276,16 @@ def main():
     elif args.command == "download-models":
         download_models_cli()
     elif args.command == "status":
-        asyncio.run(poll_batch_status(args.job_id, httpx.AsyncClient(
-            timeout=600.0), output_path=None))  # output_path is None for status
+        # FIXED: For status only, no output_path needed; adjust call
+        asyncio.run(poll_batch_status(
+            args.job_id, httpx.AsyncClient(timeout=600.0), None))
     else:
         parser.print_help()
 
 
 if __name__ == "__main__":
     main()
+
+
+# src/main.py
+# File path: src/main.py

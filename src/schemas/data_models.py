@@ -36,8 +36,8 @@ class NERPredictRequest(BaseModel):
 
 class NERPredictResponse(BaseModel):
     """Response model for the NER service's predict endpoint."""
-    entities: List[Entity] = Field(...,
-                                   description="A list of recognized named entities.")
+    entities: List[Entity] = Field(
+        default_factory=list, description="A list of recognized named entities.")
     text: str = Field(..., description="The original input text.")
 
 # --- DP Service Models ---
@@ -60,7 +60,7 @@ class DPExtractSOARequest(BaseModel):
 class DPExtractSOAResponse(BaseModel):
     """Response model for the DP service's extract-soa endpoint."""
     soa_triplets: List[SOATriplet] = Field(
-        ..., description="A list of extracted Subject-Object-Action triplets.")
+        default_factory=list, description="A list of extracted Subject-Object-Action triplets.")
     text: str = Field(..., description="The original input text.")
 
 # --- Event LLM Service Models ---
@@ -72,9 +72,9 @@ class EventLLMInput(BaseModel):
     """
     text: str = Field(..., description="The original raw text.")
     ner_entities: List[Entity] = Field(
-        ..., description="List of named entities from NER service.")
+        default_factory=list, description="List of named entities from NER service.")
     soa_triplets: List[SOATriplet] = Field(
-        ..., description="List of S-O-A triplets from Dependency Parsing service.")
+        default_factory=list, description="List of S-O-A triplets from Dependency Parsing service.")
 
 
 class ArgumentEntity(BaseModel):
@@ -124,7 +124,11 @@ class EventLLMGenerateResponse(BaseModel):
         default_factory=list, description="All extracted entities (potentially enriched by LLM).")
     extracted_soa_triplets: List[SOATriplet] = Field(
         default_factory=list, description="All extracted S-O-A triplets.")
-    original_text: str = Field(..., description="The original input text.")
+    original_text: str = Field("", description="The original input text.")
+    # FIX: Add job_id field as it is used and logged by the API layer.
+    job_id: str = Field(default_factory=lambda: str(
+        uuid.uuid4()), description="Unique ID for the generation job/trace.")
+
 
 # --- Orchestrator Service Models ---
 
@@ -199,3 +203,7 @@ class CeleryTaskResult(BaseModel):
     processed_data: List[EventLLMGenerateResponse]
     success: bool
     error: Optional[str] = None
+
+
+# src/schemas/data_models.py
+# File path: src/schemas/data_models.py

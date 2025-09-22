@@ -39,6 +39,9 @@ event_llm_service:
   top_p: 0.9
   generation_max_retries: 3 # Number of retries if JSON parsing fails
   generation_retry_delay_seconds: 2 # Delay in seconds between retries
+  # FIX: Chunking parameters added
+  chunk_size_tokens: 2048 
+  overlap_size_tokens: 128
 
 orchestrator_service:
   port: 8000
