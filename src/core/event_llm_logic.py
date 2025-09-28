@@ -4,7 +4,7 @@
 import logging
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Literal
 from src.schemas.data_models import EventLLMInput, EventLLMGenerateResponse, Event, EventArgument, ArgumentEntity, EventMetadata, TextSpan, Entity, SOATriplet
 from src.utils.config_manager import ConfigManager
 import json
@@ -13,37 +13,25 @@ from pydantic import ValidationError
 from collections import defaultdict
 import uuid
 
+# CRITICAL MODULARITY FIXES: Import logic from the new dedicated files
+from src.core.llm_domains import determine_domain, get_domain_examples, get_domain_persona
+# Import the new post-processor
+from src.core.llm_postprocessor import LLMPostProcessor
+
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log, RetryCallState
 
 # Logger for the event LLM service
 logger = logging.getLogger("event_llm_service")
 
-
 # FIX: Define a simple custom exception for retry logic
+
+
 class LLMGenerationError(Exception):
     """Custom exception raised when LLM generation or output parsing fails."""
     pass
 
-
-def map_llm_output_fields(data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Recursively maps incorrect field names from LLM output (e.g., 'predicate' to 'action')
-    to match the Pydantic schemas. This handles LLM hallucination of field names.
-    """
-    if isinstance(data, dict):
-        new_data = {}
-        for k, v in data.items():
-            new_k = k
-            # CRITICAL FIX: Map 'predicate' used by LLM to 'action' expected by SOATriplet
-            if k == 'predicate':
-                new_k = 'action'
-
-            new_data[new_k] = map_llm_output_fields(v)
-        return new_data
-    elif isinstance(data, list):
-        return [map_llm_output_fields(item) for item in data]
-    else:
-        return data
+# CRITICAL MODULARITY FIX: map_llm_output_fields is moved to LLMPostProcessor class.
+# We retain _extract_first_json_block as a static utility for raw text parsing.
 
 
 def _extract_first_json_block(text: str) -> Optional[str]:
@@ -102,87 +90,6 @@ class EventLLMModel:
     model = None
     tokenizer = None
     _config_manager = None
-
-    # Define a list of diverse examples for few-shot prompting.
-    # Each example contains an 'input' (EventLLMInput structure) and an 'output' (EventLLMGenerateResponse structure).
-    # NOTE: These examples are crucial for guiding the model and should be updated with more complex, real-world
-    # scenarios, especially for handling long-form text.
-    _DIVERSE_EXAMPLES = [
-        {
-            "input": {
-                "text": "Ukrainian forces launched a counteroffensive near Kharkiv, reclaiming several villages.",
-                "ner_entities": [
-                    {"text": "Ukrainian", "type": "NORP",
-                        "start_char": 0, "end_char": 9},
-                    {"text": "Kharkiv", "type": "LOC",
-                        "start_char": 43, "end_char": 50}
-                ]
-            },
-            "output": {
-                "events": [
-                    {
-                        "event_type": "military_conflict",
-                        "trigger": {"text": "counteroffensive", "start_char": 20, "end_char": 36},
-                        "arguments": [
-                            {"argument_role": "agent", "entity": {
-                                "text": "Ukrainian forces", "type": "NORP", "start_char": 0, "end_char": 16}},
-                            {"argument_role": "location", "entity": {
-                                "text": "near Kharkiv", "type": "LOC", "start_char": 37, "end_char": 49}}
-                        ],
-                        "metadata": {"sentiment": "neutral", "causality": "The counteroffensive led to the reclamation of villages."}
-                    }
-                ],
-                "extracted_entities": [
-                    {"text": "Ukrainian forces", "type": "NORP",
-                        "start_char": 0, "end_char": 16},
-                    {"text": "Kharkiv", "type": "LOC",
-                        "start_char": 43, "end_char": 50}
-                ],
-                "extracted_soa_triplets": [
-                    {"subject": {"text": "Ukrainian forces", "start_char": 0, "end_char": 16},
-                     "action": {"text": "launched", "start_char": 17, "end_char": 25},
-                     "object": {"text": "counteroffensive", "start_char": 26, "end_char": 42}}
-                ]
-            }
-        },
-        {
-            "input": {
-                "text": "The Central Bank of Europe announced a 25 basis point interest rate hike, leading to a surge in bond yields.",
-                "ner_entities": [
-                    {"text": "Central Bank of Europe", "type": "ORG",
-                        "start_char": 4, "end_char": 26},
-                    {"text": "25 basis point", "type": "CARDINAL",
-                        "start_char": 39, "end_char": 53}
-                ]
-            },
-            "output": {
-                "events": [
-                    {
-                        "event_type": "economic_policy",
-                        "trigger": {"text": "announced", "start_char": 27, "end_char": 36},
-                        "arguments": [
-                            {"argument_role": "agent", "entity": {
-                                "text": "The Central Bank of Europe", "type": "ORG", "start_char": 0, "end_char": 26}},
-                            {"argument_role": "change", "entity": {
-                                "text": "interest rate hike", "type": "OTHER", "start_char": 54, "end_char": 72}}
-                        ],
-                        "metadata": {"sentiment": "neutral", "causality": "The interest rate hike caused a surge in bond yields."}
-                    }
-                ],
-                "extracted_entities": [
-                    {"text": "The Central Bank of Europe",
-                        "type": "ORG", "start_char": 0, "end_char": 26},
-                    {"text": "25 basis point", "type": "CARDINAL",
-                        "start_char": 39, "end_char": 53}
-                ],
-                "extracted_soa_triplets": [
-                    {"subject": {"text": "The Central Bank of Europe", "start_char": 0, "end_char": 26},
-                     "action": {"text": "announced", "start_char": 27, "end_char": 36},
-                     "object": {"text": "a 25 basis point interest rate hike", "start_char": 37, "end_char": 72}}
-                ]
-            }
-        }
-    ]
 
     def __new__(cls, *args, **kwargs):
         """
@@ -263,9 +170,15 @@ class EventLLMModel:
         if self.model is None or self.tokenizer is None:
             raise RuntimeError("LLM model or tokenizer is not initialized.")
 
+        # CRITICAL FIX: Dynamically determine the domain and select examples using the new module
+        domain = determine_domain(input_data.text)
+        examples_to_use = get_domain_examples(domain)
+        persona = get_domain_persona(domain)
+
         if mode == "chunk":
+
             system_instruction = (
-                "You are an expert event extraction and entity recognition system. Your task is to analyze the provided text and "
+                f"You are {persona}. Your task is to analyze the provided text and "
                 "extract all relevant events and entities based strictly on the content of the text. "
                 "You must respond with a single, valid JSON object that adheres to the Pydantic schema for `EventLLMGenerateResponse`.\n\n"
                 "Key rules:\n"
@@ -273,11 +186,11 @@ class EventLLMModel:
                 "2.  **STRICT JSON FORMAT:** The response must be a single JSON object matching the schema `EventLLMGenerateResponse`.\n"
                 "3.  **ACCURATE OFFSETS:** Ensure all character offsets (`start_char`, `end_char`) are precise and correct.\n"
                 "4.  **RELEVANT INFORMATION ONLY:** Do not include any information not present in the text.\n"
-                "5.  **EVENT TYPES:** Identify common event types like 'travel', 'earthquake', 'policy_change', 'military_conflict', etc.\n\n"
+                "5.  **MULTI-ENTITY ARGUMENTS:** For argument roles that refer to multiple entities (e.g., 'recipients', 'parties'), use the `entities` field instead of the singular `entity` field in the JSON output.\n\n"
             )
             # Few-shot examples for chunk-level extraction
             examples_prompt = ""
-            for example in self._DIVERSE_EXAMPLES:
+            for example in examples_to_use:
                 examples_prompt += f"Input:\n{json.dumps(example['input'], indent=2)}\n\n"
                 examples_prompt += f"Output:\n{json.dumps(example['output'], indent=2)}\n\n"
             user_input_prompt = f"Input:\n{json.dumps(input_data.dict(exclude={'events', 'extracted_entities', 'extracted_soa_triplets'}), indent=2)}\n\nOutput:\n"
@@ -294,7 +207,8 @@ class EventLLMModel:
                 "1. **HIGH-LEVEL SYNTHESIS:** Your output must represent the main narrative (1-3 events MAX).\n"
                 "2. **STRICT JSON FORMAT:** The response must be a single JSON object matching the schema.\n"
                 "3. **ACCURATE OFFSETS:** Retain original character offsets relative to the initial long document.\n"
-                "4. **SOA TRIPLETS:** Omit extracted_soa_triplets from your final synthesized output.\n\n"
+                "4. **SOA TRIPLETS:** Omit extracted_soa_triplets from your final synthesized output.\n"
+                "5. **MULTI-ENTITY ARGUMENTS:** For argument roles that refer to multiple entities (e.g., 'recipients', 'parties'), use the `entities` field instead of the singular `entity` field in the JSON output.\n\n"
             )
 
             # FIX: Only pass aggregated data, NOT the entire original document text
@@ -386,8 +300,9 @@ class EventLLMModel:
             # Sanitize response (stripping non-json noise outside the LLM cleanup)
             raw_response = raw_response.strip().lstrip("```json").rstrip("```").strip()
 
-            # Print raw response for debugging purposes (as requested)
-            logger.error(f"Failing raw response (pre-parse): {raw_response}")
+            # CRITICAL FIX: Change log level from ERROR to DEBUG/INFO for the raw response.
+            # We use DEBUG for the raw output dump, as this is purely a diagnostic log.
+            logger.debug(f"Raw LLM response (pre-parse): {raw_response}")
 
             # FIX: Robust JSON loading
             try:
@@ -399,11 +314,10 @@ class EventLLMModel:
                 logger.error(error_msg)
                 raise LLMGenerationError(error_msg) from e
 
-            # --- CRITICAL FIX 2: Apply LLM Output Field Mapping (Predicate -> Action) ---
-            json_data = map_llm_output_fields(json_data)
+            # --- CRITICAL FIX 3: Delegate post-processing, validation, and imputation ---
+            # This is where we run the new LLMPostProcessor to map fields, validate, and fill nulls.
+            response_model = LLMPostProcessor.post_process_response(json_data)
 
-            # Validate the JSON data against the Pydantic schema
-            response_model = EventLLMGenerateResponse(**json_data)
             return response_model
 
         except ValidationError as e:
@@ -425,7 +339,7 @@ class EventLLMModel:
         Splits a long text into smaller chunks for sequential processing.
         Uses a sliding window approach with a specified overlap to preserve context.
         """
-        # CRITICAL FIX: Check if tokenizer is None due to initialization failure
+        # CRITICAL CHECK: Check if tokenizer is None due to initialization failure
         if self.tokenizer is None:
             raise RuntimeError(
                 "Tokenizer is None. LLM model initialization failed.")
@@ -504,7 +418,8 @@ class EventLLMModel:
                     event.event_type.lower(),
                     event.trigger.text.lower(),
                     # Entities are important for de-duping, use a tuple of sorted argument texts
-                    tuple(sorted(arg.entity.text.lower()
+                    # CRITICAL FIX: Handle both `entity` and `entities` fields when creating the key
+                    tuple(sorted(arg.entity.text.lower() if arg.entity else ""
                                  for arg in event.arguments))
                 )
                 if event_key not in seen_event_keys:
@@ -540,7 +455,7 @@ class EventLLMModel:
                 soa_key = (
                     soa.subject.text.lower(),
                     soa.action.text.lower(),
-                    soa.object.text.lower()
+                    soa.object.text.lower() if soa.object else ""
                 )
                 if soa_key not in seen_soa_keys:
                     aggregated_soa_triplets.append(soa)
@@ -603,28 +518,25 @@ class EventLLMModel:
                 # Raise LLMGenerationError to signal tenacity for a retry
                 raise LLMGenerationError(error_msg) from e
 
-            # FIX: Apply field mapping before validation
-            json_data = map_llm_output_fields(json_data)
-
-            # The synthesis pass is only for main events and key entities.
-            # We explicitly *remove* any SOA triplets that the LLM might hallucinate.
+            # --- CRITICAL FIX 3: Delegate post-processing, validation, and imputation ---
+            # This is where we run the new LLMPostProcessor to map fields, validate, and fill nulls.
+            # We explicitly remove SOA triplets here as the LLM is instructed not to generate them in synthesis.
             if "extracted_soa_triplets" in json_data:
                 del json_data["extracted_soa_triplets"]
 
-            # Validate the synthesized JSON
-            synthesized_response = EventLLMGenerateResponse(**json_data)
+            response_model = LLMPostProcessor.post_process_response(json_data)
 
             # Ensure the synthesized response has the original job_id and text from aggregation pass
-            synthesized_response.job_id = aggregated_response.job_id
-            synthesized_response.original_text = original_text
+            response_model.job_id = aggregated_response.job_id
+            response_model.original_text = original_text
 
             # Additional check: ensure max 3 events
-            if len(synthesized_response.events) > 3:
+            if len(response_model.events) > 3:
                 logger.warning(
-                    f"Synthesis returned {len(synthesized_response.events)} events. Truncating to 3 main events.")
-                synthesized_response.events = synthesized_response.events[:3]
+                    f"Synthesis returned {len(response_model.events)} events. Truncating to 3 main events.")
+                response_model.events = response_model.events[:3]
 
-            return synthesized_response
+            return response_model
 
         except ValidationError as e:
             logger.error(
@@ -642,7 +554,7 @@ class EventLLMModel:
         """
         Main method to process a long article using a two-pass pipeline.
         It orchestrates the chunking, individual chunk processing, and final synthesis.
-        
+
         NOTE: The ner_entities input is now expected to be a list of Pydantic Entity objects, 
         as received from the EventLLMInput validation layer.
         """
@@ -659,6 +571,7 @@ class EventLLMModel:
         # Pass 1: Chunk-level extraction and aggregation
         # Parameters retrieved from config/self
 
+        #
         logger.info(
             f"Initiating two-pass pipeline for article of length {len(article_text)} characters.")
 
@@ -708,8 +621,13 @@ class EventLLMModel:
                     event.trigger.start_char += offset
                     event.trigger.end_char += offset
                     for arg in event.arguments:
-                        arg.entity.start_char += offset
-                        arg.entity.end_char += offset
+                        if arg.entity:
+                            arg.entity.start_char += offset
+                            arg.entity.end_char += offset
+                        if arg.entities:
+                            for entity in arg.entities:
+                                entity.start_char += offset
+                                entity.end_char += offset
                 for entity in chunk_response.extracted_entities:
                     entity.start_char += offset
                     entity.end_char += offset
@@ -718,8 +636,9 @@ class EventLLMModel:
                     soa.subject.end_char += offset
                     soa.action.start_char += offset
                     soa.action.end_char += offset
-                    soa.object.start_char += offset
-                    soa.object.end_char += offset
+                    if soa.object:
+                        soa.object.start_char += offset
+                        soa.object.end_char += offset
 
                 chunked_responses.append(chunk_response)
                 logger.info(
@@ -743,9 +662,8 @@ class EventLLMModel:
         if len(chunks) == 1 and len(chunked_responses) == 1:
             logger.info(
                 "Single chunk processed successfully. Bypassing redundant synthesis step.")
-            # Ensure the aggregated response events are clean for the single-chunk output.
-            # In a true single-chunk scenario, the low-level events ARE the main events.
-            return aggregated_response
+            # Run post-processing/imputation to clean up any null fields even in a single chunk output
+            return LLMPostProcessor.impute_missing_metadata(aggregated_response)
 
         # If all chunks failed, the aggregated response will be empty, skip synthesis
         if not aggregated_response.events:
