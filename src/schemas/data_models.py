@@ -1,7 +1,7 @@
 # src/schemas/data_models.py
 # File path: src/schemas/data_models.py
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 from pydantic import BaseModel, Field, HttpUrl
 import uuid
 
@@ -88,11 +88,20 @@ class ArgumentEntity(BaseModel):
 
 
 class EventArgument(BaseModel):
-    """Represents an argument of an extracted event."""
+    """
+    Represents an argument of an extracted event.
+    
+    CRITICAL FIX: This model is re-engineered to handle cases where an argument role
+    (e.g., 'recipients') is filled by a list of entities rather than a single one.
+    This resolves the Pydantic ValidationError.
+    """
     argument_role: str = Field(
-        ..., description="The role of the argument (e.g., Agent, Patient, Time, Location).")
-    entity: ArgumentEntity = Field(...,
-                                   description="The entity filling this argument role.")
+        ..., description="The role of the argument (e.g., Agent, Patient, Time, Location, Recipients).")
+    # Use Optional and Union to accept either a single entity or a list of entities.
+    entity: Optional[ArgumentEntity] = Field(
+        None, description="The single entity filling this argument role, if applicable.")
+    entities: Optional[List[ArgumentEntity]] = Field(
+        None, description="A list of entities filling this argument role, if applicable.")
 
 
 class EventMetadata(BaseModel):
