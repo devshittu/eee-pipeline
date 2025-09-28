@@ -7,18 +7,22 @@ from src.schemas.data_models import EventLLMGenerateResponse, Event, EventMetada
 
 logger = logging.getLogger("llm_postprocessor")
 
+
 class LLMPostProcessor:
     """
-    Handles post-generation cleanup, field mapping, and imputation of missing data
-    to ensure the final output strictly adheres to the schema with no null or empty fields.
-    This module separates concerns from the main LLM orchestration logic (DRY/SOLID).
+    Handles post-generation cleanup, field mapping, and normalization of model output
+    to ensure the final output strictly adheres to the schema.
+    
+    CRITICAL CHANGE: Removed aggressive imputation logic to avoid polluting downstream
+    analytics with false sentiments/causality. Now, it only cleans empty strings,
+    allowing truly missing data to remain 'null' as per the schema definition.
     """
 
     @staticmethod
     def map_and_normalize_data(data: Dict[str, Any]) -> Dict[str, Any]:
         """
         Recursively maps inconsistent field names and performs type normalization 
-        before Pydantic validation. This is decoupled from the main LLM logic.
+        before Pydantic validation.
         """
         if isinstance(data, dict):
             new_data = {}
@@ -27,7 +31,7 @@ class LLMPostProcessor:
                 # 1. Map inconsistent names (LLM hallucination fix)
                 if k == 'predicate':
                     new_k = 'action'
-                
+
                 # 2. Recursively process nested structures
                 processed_v = LLMPostProcessor.map_and_normalize_data(v)
 
@@ -50,55 +54,34 @@ class LLMPostProcessor:
                 del new_data["entity"]
 
             return new_data
-        
+
         elif isinstance(data, list):
             return [LLMPostProcessor.map_and_normalize_data(item) for item in data]
-        
-        # 4. Handle nulls before Pydantic validation (Pydantic will treat explicit nulls as missing if optional)
-        elif data is None:
-            return None # Allow Pydantic to handle Optional fields
-        
-        return data
 
-    @staticmethod
-    def impute_missing_metadata(response: EventLLMGenerateResponse) -> EventLLMGenerateResponse:
-        """
-        Imputes standard, usable strings for missing or null metadata fields (sentiment, causality).
-        This prevents empty or null fields in the final output, making it immediately usable.
-        """
-        for event in response.events:
-            if not event.metadata:
-                # Initialize metadata if null (impute basic structure)
-                event.metadata = EventMetadata(
-                    sentiment="neutral",
-                    causality="The LLM did not provide specific causality data."
-                )
-            else:
-                # Impute missing fields within existing metadata object
-                if event.metadata.sentiment is None:
-                    event.metadata.sentiment = "neutral"
-                
-                if event.metadata.causality is None or event.metadata.causality.strip() == "":
-                    # Impute specific causality based on event type if possible, otherwise generic
-                    default_causality = f"The LLM was unable to determine a specific causality for the '{event.event_type}' event."
-                    event.metadata.causality = default_causality
-        
-        return response
+        # 4. Handle nulls and empty strings: Prefer returning None for optional Pydantic fields
+        # If a field is explicitly "" or None, return None. Pydantic handles null correctly.
+        elif data == "" or data is None:
+            return None
+
+        return data
 
     @staticmethod
     def post_process_response(raw_json_data: Dict[str, Any]) -> EventLLMGenerateResponse:
         """
-        Executes the full post-processing pipeline: mapping, validation, and imputation.
+        Executes the full post-processing pipeline: mapping and validation.
+        The imputation step is removed per user request.
         """
-        # 1. Map and Normalize
+        # 1. Map and Normalize (Handles "predicate" -> "action" and ensures lists are nested correctly)
         cleaned_data = LLMPostProcessor.map_and_normalize_data(raw_json_data)
-        
+
         # 2. Validate against Pydantic schema
+        # This step automatically sets missing optional fields (like metadata.sentiment) to None (null in JSON).
         validated_response = EventLLMGenerateResponse(**cleaned_data)
-        
-        # 3. Impute missing metadata (to fix nulls in final JSON)
-        final_response = LLMPostProcessor.impute_missing_metadata(validated_response)
-        
-        return final_response
+
+        # NOTE: Imputation is intentionally removed here to honor the requirement
+        # that fields should be truly null if the LLM cannot provide a value.
+
+        return validated_response
+
 # src/core/llm_postprocessor.py
 # File path: src/core/llm_postprocessor.py
