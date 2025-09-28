@@ -175,6 +175,13 @@ class EventLLMModel:
         examples_to_use = get_domain_examples(domain)
         persona = get_domain_persona(domain)
 
+        # --- CRITICAL METADATA INSTRUCTION ---
+        metadata_instruction = (
+            "6.  **STRICT METADATA:** You **MUST NOT** use `null`, empty string (`\"\"`), or `None` values for the `sentiment` or `causality` fields in the `metadata` object. "
+            "If sentiment cannot be determined (e.g., purely factual), use `neutral`. If causality is not explicit, infer the most likely cause/effect from the sentence. "
+            "If you cannot infer a strong, unique causality, summarize the event itself as the causality. **NEVER** return `null` or `\"\"` for these fields."
+        )
+
         if mode == "chunk":
 
             system_instruction = (
@@ -186,7 +193,8 @@ class EventLLMModel:
                 "2.  **STRICT JSON FORMAT:** The response must be a single JSON object matching the schema `EventLLMGenerateResponse`.\n"
                 "3.  **ACCURATE OFFSETS:** Ensure all character offsets (`start_char`, `end_char`) are precise and correct.\n"
                 "4.  **RELEVANT INFORMATION ONLY:** Do not include any information not present in the text.\n"
-                "5.  **MULTI-ENTITY ARGUMENTS:** For argument roles that refer to multiple entities (e.g., 'recipients', 'parties'), use the `entities` field instead of the singular `entity` field in the JSON output.\n\n"
+                "5.  **MULTI-ENTITY ARGUMENTS:** For argument roles that refer to multiple entities (e.g., 'recipients', 'parties'), use the `entities` field instead of the singular `entity` field in the JSON output.\n"
+                f"{metadata_instruction}\n"
             )
             # Few-shot examples for chunk-level extraction
             examples_prompt = ""
@@ -208,7 +216,9 @@ class EventLLMModel:
                 "2. **STRICT JSON FORMAT:** The response must be a single JSON object matching the schema.\n"
                 "3. **ACCURATE OFFSETS:** Retain original character offsets relative to the initial long document.\n"
                 "4. **SOA TRIPLETS:** Omit extracted_soa_triplets from your final synthesized output.\n"
-                "5. **MULTI-ENTITY ARGUMENTS:** For argument roles that refer to multiple entities (e.g., 'recipients', 'parties'), use the `entities` field instead of the singular `entity` field in the JSON output.\n\n"
+                "5. **MULTI-ENTITY ARGUMENTS:** For argument roles that refer to multiple entities (e.g., 'recipients', 'parties'), use the `entities` field instead of the singular `entity` field in the JSON output.\n"
+                # Apply strict metadata rule here too
+                f"{metadata_instruction}\n"
             )
 
             # FIX: Only pass aggregated data, NOT the entire original document text
@@ -316,14 +326,15 @@ class EventLLMModel:
 
             # --- CRITICAL FIX 3: Delegate post-processing, validation, and imputation ---
             # This is where we run the new LLMPostProcessor to map fields, validate, and fill nulls.
+            # Imputation is removed from LLMPostProcessor, so it focuses on validation/cleanup.
             response_model = LLMPostProcessor.post_process_response(json_data)
 
             return response_model
 
         except ValidationError as e:
+            # Re-raise ValidationError to trigger tenacity retry mechanism
             logger.error(f"Validation error for chunk: {e}")
             logger.error(f"Failing raw response: {raw_response}")
-            # Re-raise existing ValidationError to ensure tenacity retry is triggered
             raise
         except Exception as e:
             # This catch is for unexpected errors outside of Validation/JSON decoding
@@ -663,13 +674,15 @@ class EventLLMModel:
             logger.info(
                 "Single chunk processed successfully. Bypassing redundant synthesis step.")
             # Run post-processing/imputation to clean up any null fields even in a single chunk output
-            return LLMPostProcessor.impute_missing_metadata(aggregated_response)
+            # CRITICAL FIX: Only run post_process_response which cleans up empty strings, preserving explicit nulls.
+            return LLMPostProcessor.post_process_response(aggregated_response.dict())
 
         # If all chunks failed, the aggregated response will be empty, skip synthesis
         if not aggregated_response.events:
             logger.warning(
                 "No events extracted from any chunk. Skipping synthesis.")
-            return aggregated_response  # Return the empty aggregated response
+            # CRITICAL FIX: Run final cleanup even on empty response to ensure metadata is clean.
+            return LLMPostProcessor.post_process_response(aggregated_response.dict())
 
         # _synthesize_main_events has the retry logic baked in
         final_response = self._synthesize_main_events(
