@@ -30,6 +30,9 @@ FROM base AS build
 WORKDIR /app
 
 # Copy only requirements to leverage Docker cache
+
+# Copy base requirements first, then service requirements
+COPY requirements_base.txt .
 COPY requirements_celery_worker.txt .
 
 # Install Python dependencies explicitly into the virtual environment
