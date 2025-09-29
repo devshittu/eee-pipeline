@@ -29,6 +29,7 @@ docker-compose.override.yml
 data/
 models/
 model_cache/
+.model_cache/
 checkpoints/
 **/*_data/*
 lightning_logs/

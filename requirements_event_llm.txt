@@ -10,6 +10,7 @@ transformers==4.41.2
 accelerate==0.30.1 # For efficient model loading and inference on GPU
 bitsandbytes==0.43.1 # For quantization (e.g., if using 8-bit, 4-bit models)
 sentencepiece==0.1.99 # For some LLM tokenizers
+protobuf==3.20.3 # CRITICAL FIX: Required by LlamaTokenizer (Mistral) with legacy=False
 # Optional: For T5/Flan-T5 models
 # einops==0.8.0
 # optimum==1.19.0 # For ONNX Runtime or other optimizations

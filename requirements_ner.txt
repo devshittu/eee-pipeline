@@ -4,7 +4,7 @@
 fastapi==0.111.0
 uvicorn==0.30.1
 pydantic==2.7.1
-pydantic-settings==2.2.1
+pydantic-settings==2.2.1 # TODO: Check if needed I need to use the base requirements here and the kinds that calls in
 transformers==4.41.2
 torch==2.3.0 # or tensorflow depending on backend
 python-json-logger==2.0.7

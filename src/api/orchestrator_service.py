@@ -65,7 +65,8 @@ async def startup_event():
             f"Failed to connect to dependent services at startup: {e}", exc_info=True)
         # Proceed but health check will fail
         # You might want to raise an exception here to prevent the orchestrator from starting
-        # if core dependencies are down. For now, it will proceed but health check will fail.
+        # if core dependencies are down.
+        pass  # For now, it will proceed but health check will fail.
     logger.info("Orchestrator Service startup complete.")
 
 
@@ -96,6 +97,7 @@ async def health_check():
         logger.info("Performing health check on dependent services...")
         logger.debug(
             f"Checking health: ner={ner_url}, dp={dp_url}, llm={llm_url}")
+
         # Check dependent microservices
         ner_health = await http_client.get(ner_url)
         dp_health = await http_client.get(dp_url)
@@ -175,6 +177,7 @@ async def process_text(request: ProcessTextRequest):
         llm_input = EventLLMInput(
             text=text,
             ner_entities=ner_results.entities,
+            # Passed as per schema, LLM service will use it or discard it for synthesis.
             soa_triplets=dp_results.soa_triplets
         )
         logger.debug("Prepared input for Event LLM service.")
@@ -217,7 +220,8 @@ async def process_text(request: ProcessTextRequest):
 @app.post("/process-batch", response_model=Dict[str, str], status_code=status.HTTP_202_ACCEPTED)
 async def process_batch(request: ProcessBatchRequest, background_tasks: BackgroundTasks):
     """
-    Accepts a list of text inputs. This is an asynchronous endpoint that dispatches
+    Accepts a list of text inputs.
+    This is an asynchronous endpoint that dispatches
     the batch processing to Celery workers and returns a job_id for status tracking.
     Stores task IDs in Redis for status tracking.
     """

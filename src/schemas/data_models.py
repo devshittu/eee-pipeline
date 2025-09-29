@@ -1,7 +1,7 @@
 # src/schemas/data_models.py
 # File path: src/schemas/data_models.py
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 from pydantic import BaseModel, Field, HttpUrl
 import uuid
 
@@ -36,8 +36,8 @@ class NERPredictRequest(BaseModel):
 
 class NERPredictResponse(BaseModel):
     """Response model for the NER service's predict endpoint."""
-    entities: List[Entity] = Field(...,
-                                   description="A list of recognized named entities.")
+    entities: List[Entity] = Field(
+        default_factory=list, description="A list of recognized named entities.")
     text: str = Field(..., description="The original input text.")
 
 # --- DP Service Models ---
@@ -60,7 +60,7 @@ class DPExtractSOARequest(BaseModel):
 class DPExtractSOAResponse(BaseModel):
     """Response model for the DP service's extract-soa endpoint."""
     soa_triplets: List[SOATriplet] = Field(
-        ..., description="A list of extracted Subject-Object-Action triplets.")
+        default_factory=list, description="A list of extracted Subject-Object-Action triplets.")
     text: str = Field(..., description="The original input text.")
 
 # --- Event LLM Service Models ---
@@ -72,9 +72,9 @@ class EventLLMInput(BaseModel):
     """
     text: str = Field(..., description="The original raw text.")
     ner_entities: List[Entity] = Field(
-        ..., description="List of named entities from NER service.")
+        default_factory=list, description="List of named entities from NER service.")
     soa_triplets: List[SOATriplet] = Field(
-        ..., description="List of S-O-A triplets from Dependency Parsing service.")
+        default_factory=list, description="List of S-O-A triplets from Dependency Parsing service.")
 
 
 class ArgumentEntity(BaseModel):
@@ -88,11 +88,20 @@ class ArgumentEntity(BaseModel):
 
 
 class EventArgument(BaseModel):
-    """Represents an argument of an extracted event."""
+    """
+    Represents an argument of an extracted event.
+    
+    CRITICAL FIX: This model is re-engineered to handle cases where an argument role
+    (e.g., 'recipients') is filled by a list of entities rather than a single one.
+    This resolves the Pydantic ValidationError.
+    """
     argument_role: str = Field(
-        ..., description="The role of the argument (e.g., Agent, Patient, Time, Location).")
-    entity: ArgumentEntity = Field(...,
-                                   description="The entity filling this argument role.")
+        ..., description="The role of the argument (e.g., Agent, Patient, Time, Location, Recipients).")
+    # Use Optional and Union to accept either a single entity or a list of entities.
+    entity: Optional[ArgumentEntity] = Field(
+        None, description="The single entity filling this argument role, if applicable.")
+    entities: Optional[List[ArgumentEntity]] = Field(
+        None, description="A list of entities filling this argument role, if applicable.")
 
 
 class EventMetadata(BaseModel):
@@ -124,7 +133,11 @@ class EventLLMGenerateResponse(BaseModel):
         default_factory=list, description="All extracted entities (potentially enriched by LLM).")
     extracted_soa_triplets: List[SOATriplet] = Field(
         default_factory=list, description="All extracted S-O-A triplets.")
-    original_text: str = Field(..., description="The original input text.")
+    original_text: str = Field("", description="The original input text.")
+    # FIX: Add job_id field as it is used and logged by the API layer.
+    job_id: str = Field(default_factory=lambda: str(
+        uuid.uuid4()), description="Unique ID for the generation job/trace.")
+
 
 # --- Orchestrator Service Models ---
 
@@ -199,3 +212,7 @@ class CeleryTaskResult(BaseModel):
     processed_data: List[EventLLMGenerateResponse]
     success: bool
     error: Optional[str] = None
+
+
+# src/schemas/data_models.py
+# File path: src/schemas/data_models.py

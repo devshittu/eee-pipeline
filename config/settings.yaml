@@ -33,10 +33,15 @@ event_llm_service:
   model_name: "mistralai/Mistral-7B-Instruct-v0.2" # CHANGED MODEL NAME
   model_path: "/app/cache/llm/mistral-7b-instruct-v0.2" # Path to your fine-tuned or downloaded LLM
   model_cache_dir: "/app/cache/llm"
-  request_timeout_seconds: 300 # Timeout for requests to the Event LLM service in seconds
+  request_timeout_seconds: 900 # Timeout for requests to the Event LLM service in seconds
   max_new_tokens: 4096 # Keeping this as you expect large output
   temperature: 0.7
   top_p: 0.9
+  generation_max_retries: 3 # Number of retries if JSON parsing fails
+  generation_retry_delay_seconds: 2 # Delay in seconds between retries
+  # FIX: Chunking parameters added
+  chunk_size_tokens: 2048 
+  overlap_size_tokens: 128
 
 orchestrator_service:
   port: 8000
@@ -46,6 +51,29 @@ orchestrator_service:
   batch_processing_chunk_size: 100 # Number of documents to process in one Celery task
   batch_processing_job_results_ttl: 3600 # seconds (1 hour)
   request_timeout_seconds: 300 # Timeout for requests to the orchestrator service in seconds
+
+
+storage:
+  enabled_backends: ["jsonl"] # Example: Only enabling JSONL for now
+  
+  jsonl:
+    output_path: "/app/data/extracted_events.jsonl" # Path for daily JSONL persistence
+
+  elasticsearch:
+    host: "elasticsearch" # Docker service name
+    port: 9200
+    scheme: "http"
+    index_name: "eee_events"
+    api_key: null
+
+  postgresql:
+    host: "postgres" # Docker service name
+    port: 5432
+    dbname: "eeedb"
+    user: "user"
+    password: "password"
+    table_name: "extracted_events"
+
 
 celery:
   broker_url: "redis://redis:6379/0"

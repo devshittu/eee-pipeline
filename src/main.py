@@ -6,13 +6,15 @@ import asyncio
 import json
 import os
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import httpx
 from src.utils.config_manager import ConfigManager
 from src.utils.logger import setup_logging
 from src.schemas.data_models import ProcessTextRequest, ProcessBatchRequest, BatchJobStatusResponse, EventLLMGenerateResponse
 import dask.bag as db
 from dask.distributed import Client, LocalCluster
+# Import factory for direct use
+from src.storage.backends import StorageBackendFactory, JSONLStorageBackend
 
 # Configure logging for CLI
 setup_logging()
@@ -24,19 +26,34 @@ orchestrator_url = f"http://localhost:{settings.orchestrator_service.port}"
 
 
 async def process_single_cli(text: str):
-    """Processes a single text string via the Orchestrator API."""
+    """
+    Processes a single text string via the Orchestrator API.
+    CRITICAL FIX: Persists the result using the StorageBackendFactory after receiving the output.
+    """
     async with httpx.AsyncClient(timeout=600.0) as client:
         try:
             logger.info(
                 f"Sending single text (len: {len(text)}) to Orchestrator service: {orchestrator_url}/process-text")
             response = await client.post(
                 f"{orchestrator_url}/process-text",
-                json=ProcessTextRequest(text=text).dict()
+                json=ProcessTextRequest(text=text).model_dump()
             )
             response.raise_for_status()
-            result = response.json()
-            logger.info("Successfully processed single text.")
-            print(json.dumps(result, indent=2, ensure_ascii=False))
+            result_dict = response.json()
+
+            # --- Persistence of Single Result ---
+            final_output = EventLLMGenerateResponse.parse_obj(result_dict)
+            backends = StorageBackendFactory.get_backends()
+
+            # Persist to all configured backends
+            for backend in backends:
+                backend.save(final_output)
+
+            logger.info(
+                "Successfully processed and persisted single text result.")
+            print(json.dumps(final_output.model_dump(),
+                  indent=2, ensure_ascii=False))
+
         except httpx.HTTPStatusError as e:
             logger.error(
                 f"HTTP error processing single text: {e.response.status_code} - {e.response.text}", exc_info=True)
@@ -52,8 +69,8 @@ async def process_single_cli(text: str):
 
 async def process_file_cli(input_path: str, output_path: str):
     """
-    Processes a file containing multiple texts in bulk via the Orchestrator API
-    using Dask for local parallelism before dispatching.
+    Processes a file containing multiple texts in bulk via the Orchestrator API.
+    Dispatches to Celery, and initiates status polling.
     """
     if not os.path.exists(input_path):
         logger.error(f"Input file not found: {input_path}")
@@ -81,35 +98,21 @@ async def process_file_cli(input_path: str, output_path: str):
         logger.info(
             f"Dask LocalCluster initialized for CLI: {client.dashboard_link if client.dashboard_link else 'N/A'}")
 
-        # Read file using Dask Bag for parallelization
-        # Assumes input_path is JSONL format: {"id": "...", "text": "..."}
-        # If it's just plain text lines, modify db.read_text and parsing
-
-        # Read the file and parse each line as JSON
-        # Error handling for malformed JSON lines
         def parse_json_line(line):
             try:
-                return json.loads(line)
+                # Assumes input format is JSONL: {"id": "...", "text": "..."}
+                data = json.loads(line)
+                return data.get("text")
             except json.JSONDecodeError as e:
                 logger.warning(
                     f"Skipping malformed JSON line in input file: {line[:100]}... Error: {e}")
                 return None
+            except Exception:
+                # Skip if the 'text' field is missing or invalid
+                return None
 
-        texts_bag = db.read_text(input_path).map(
-            parse_json_line).filter(lambda x: x is not None)
-
-        # Collect all texts to send to Orchestrator (as a single batch request)
-        # Or, chunk and send multiple batch requests to Orchestrator (more scalable for huge files)
-        # For simplicity, sending as one large list if it fits.
-
-        # For very large files, it's better to chunk the Dask Bag and send multiple
-        # batch requests to the Orchestrator, rather than collecting all at once.
-        # This will depend on the `batch_processing_chunk_size` of the Orchestrator.
-
-        # Example: Collect all texts as a list (might be memory intensive for huge files)
-        all_texts_data = texts_bag.compute()
-        texts_only = [item["text"]
-                      for item in all_texts_data if "text" in item]
+        texts_only = db.read_text(input_path).map(
+            parse_json_line).filter(lambda x: x is not None).compute()
 
         if not texts_only:
             logger.warning("No valid texts found in the input file.")
@@ -124,7 +127,7 @@ async def process_file_cli(input_path: str, output_path: str):
             batch_request = ProcessBatchRequest(texts=texts_only)
             response = await http_client_orchestrator.post(
                 f"{orchestrator_url}/process-batch",
-                json=batch_request.dict()
+                json=batch_request.model_dump()
             )
             response.raise_for_status()
             batch_info = response.json()
@@ -133,7 +136,8 @@ async def process_file_cli(input_path: str, output_path: str):
             print(
                 f"Track status with: python src/main.py status --job_id {job_id}")
 
-            # Optionally, poll for status until completion
+            # Poll for status until completion. The output_path is passed here
+            # to enable writing the aggregated JSONL file at the end.
             await poll_batch_status(job_id, http_client_orchestrator, output_path)
 
     except httpx.HTTPStatusError as e:
@@ -156,13 +160,17 @@ async def process_file_cli(input_path: str, output_path: str):
         logger.info("Dask LocalCluster closed.")
 
 
-async def poll_batch_status(job_id: str, client: httpx.AsyncClient, output_path: str):
-    """Polls the orchestrator for batch job status and saves results."""
+async def poll_batch_status(job_id: str, client: httpx.AsyncClient, output_path: Optional[str]):
+    """
+    Polls the orchestrator for batch job status and, upon completion, 
+    saves aggregated results to the specified output path using the JSONL backend logic.
+    """
     while True:
         try:
             response = await client.get(f"{orchestrator_url}/status/{job_id}")
             response.raise_for_status()
-            status_response = BatchJobStatusResponse.parse_obj(response.json())
+            status_response = BatchJobStatusResponse.model_validate(
+                response.json())
 
             print(
                 f"Job ID: {status_response.job_id}, Status: {status_response.status}", end="")
@@ -174,16 +182,25 @@ async def poll_batch_status(job_id: str, client: httpx.AsyncClient, output_path:
             print()
 
             if status_response.status == "SUCCESS":
-                if status_response.results:
-                    with open(output_path, 'w', encoding='utf-8') as f:
-                        for res in status_response.results:
-                            f.write(json.dumps(
-                                res.dict(), ensure_ascii=False) + '\n')
-                    print(
-                        f"Batch processing completed successfully. Results saved to {output_path}")
+                if status_response.results and output_path:
+                    # CRITICAL FIX: Manually handle writing the aggregated file for the CLI here.
+                    # This ensures the CLI output file matches the expected structure,
+                    # while the Celery task handles persistence to databases/daily files.
+                    try:
+                        with open(output_path, 'w', encoding='utf-8') as f:
+                            for res in status_response.results:
+                                f.write(json.dumps(
+                                    res.model_dump(), ensure_ascii=False) + '\n')
+                        print(
+                            f"Batch processing completed successfully. Aggregated results saved to {output_path}")
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to write aggregated results to {output_path}: {e}", exc_info=True)
+                        print(
+                            f"Warning: Failed to write aggregated results to {output_path}. Check logs.")
                 else:
                     print(
-                        "Batch processing completed successfully, but no results returned.")
+                        "Batch processing completed successfully. Results were persisted by Celery tasks.")
                 break
             elif status_response.status == "FAILURE":
                 print(
@@ -212,28 +229,8 @@ async def poll_batch_status(job_id: str, client: httpx.AsyncClient, output_path:
 
 def download_models_cli():
     """Triggers model download for all services locally."""
-    # This command is primarily for pre-caching models locally or within containers
-    # For Docker Compose setup, this is largely handled by entrypoint scripts.
-    # However, if running CLI without Docker Compose, this would be useful.
-    logger.info("Initiating model download. This might take some time.")
-
-    # Call a Celery task that coordinates model downloads
-    # For now, we'll just log a message as actual download is in entrypoints
-    # In a real scenario, you would have a Celery task that signals each service to download models
-    # Or, the entrypoint scripts themselves are responsible for ensuring models exist.
-    # Given the Docker setup, models download when their respective containers start.
-    # If this CLI command is meant for a *local* dev environment without Docker,
-    # then it would manually call the model download logic for each service:
-    # from src.core.ner_logic import NERModel
-    # NERModel() # This would trigger download
-    # from src.core.dp_logic import DPModel
-    # DPModel() # This would trigger download
-    # from src.core.event_llm_logic import EventLLMModel
-    # EventLLMModel() # This would trigger download
-
-    # For now, just a placeholder. The primary model download mechanism is via Docker entrypoints.
+    # Placeholder implementation remains the same.
     print("Model download command executed. Models are typically downloaded during service startup (Docker entrypoints).")
-    print("For CLI-only local model download, you would need to implement direct calls to model loading logic for each service.")
 
 
 def main():
@@ -243,21 +240,21 @@ def main():
 
     # Process single text command
     process_single_parser = subparsers.add_parser(
-        "process-single", help="Process a single text string.")
+        "process-single", help="Process a single text string and persist the result.")
     process_single_parser.add_argument(
         "--text", type=str, required=True, help="The input text string.")
 
     # Process file command
     process_file_parser = subparsers.add_parser(
-        "process-file", help="Process a file containing multiple texts (JSONL format).")
+        "process-file", help="Process a file containing multiple texts (JSONL format) and persist/output results.")
     process_file_parser.add_argument(
         "--input_path", type=str, required=True, help="Path to the input JSONL file.")
     process_file_parser.add_argument(
-        "--output_path", type=str, required=True, help="Path to save the output JSONL file.")
+        "--output_path", type=str, required=True, help="Path to save the final aggregated output JSONL file.")
 
     # Download models command
     download_models_parser = subparsers.add_parser(
-        "download-models", help="Pre-download all necessary Hugging Face and SpaCy/Stanza models for offline use.")
+        "download-models", help="Pre-download all necessary models for offline use.")
 
     # Status command for batch jobs
     status_parser = subparsers.add_parser(
@@ -274,11 +271,16 @@ def main():
     elif args.command == "download-models":
         download_models_cli()
     elif args.command == "status":
-        asyncio.run(poll_batch_status(args.job_id, httpx.AsyncClient(
-            timeout=600.0), output_path=None))  # output_path is None for status
+        # For status, output_path is not relevant, so we pass None
+        asyncio.run(poll_batch_status(
+            args.job_id, httpx.AsyncClient(timeout=600.0), None))
     else:
         parser.print_help()
 
 
 if __name__ == "__main__":
     main()
+
+
+# src/main.py
+# File path: src/main.py
