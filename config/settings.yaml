@@ -52,6 +52,29 @@ orchestrator_service:
   batch_processing_job_results_ttl: 3600 # seconds (1 hour)
   request_timeout_seconds: 300 # Timeout for requests to the orchestrator service in seconds
 
+
+storage:
+  enabled_backends: ["jsonl"] # Example: Only enabling JSONL for now
+  
+  jsonl:
+    output_path: "/app/data/extracted_events.jsonl" # Path for daily JSONL persistence
+
+  elasticsearch:
+    host: "elasticsearch" # Docker service name
+    port: 9200
+    scheme: "http"
+    index_name: "eee_events"
+    api_key: null
+
+  postgresql:
+    host: "postgres" # Docker service name
+    port: 5432
+    dbname: "eeedb"
+    user: "user"
+    password: "password"
+    table_name: "extracted_events"
+
+
 celery:
   broker_url: "redis://redis:6379/0"
   result_backend: "redis://redis:6379/0"
