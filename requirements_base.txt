@@ -1,0 +1,10 @@
+# requirements_base.txt
+# Core non-model dependencies required across multiple services (Orchestrator, Celery Worker).
+pydantic==2.7.1
+pydantic-settings==2.2.1
+python-json-logger==2.0.7
+PyYAML==6.0.1
+
+# CRITICAL FIX: psycopg2 is needed in any container importing src/storage/backends.py for class definitions
+# Even if only the Celery Worker uses it, the orchestrator still needs the import to compile the class definition.
+psycopg2-binary==2.9.9
