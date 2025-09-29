@@ -3,7 +3,7 @@
 
 import os
 from functools import lru_cache
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 import yaml
 from pydantic import BaseModel, Field, HttpUrl
 
@@ -49,8 +49,6 @@ class EventLLMServiceSettings(ServiceSettings):
         128, description="Token overlap size between consecutive chunks.")
 
 
-
-
 class OrchestratorServiceSettings(ServiceSettings):
     ner_service_url: HttpUrl
     dp_service_url: HttpUrl
@@ -58,6 +56,40 @@ class OrchestratorServiceSettings(ServiceSettings):
     batch_processing_chunk_size: int = 100
     batch_processing_job_results_ttl: int = 3600  # seconds
     request_timeout_seconds: int = 120
+
+
+# --- CRITICAL FIX: Add Storage Configuration Models ---
+class JsonlStorageConfig(BaseModel):
+    output_path: str = Field(...,
+                             description="Full path for the JSONL output file.")
+
+
+class ElasticsearchStorageConfig(BaseModel):
+    host: str
+    port: int
+    scheme: str = "http"
+    index_name: str
+    api_key: Optional[str] = None
+    # Add other ES parameters (e.g., basic_auth) if needed
+
+
+class PostgreSQLStorageConfig(BaseModel):
+    host: str
+    port: int
+    dbname: str
+    user: str
+    password: str
+    table_name: str
+
+
+class StorageSettings(BaseModel):
+    enabled_backends: List[str] = Field(
+        default_factory=lambda: ["jsonl"],
+        description="List of active persistence backends (e.g., ['jsonl', 'postgresql'])."
+    )
+    jsonl: Optional[JsonlStorageConfig] = None
+    elasticsearch: Optional[ElasticsearchStorageConfig] = None
+    postgresql: Optional[PostgreSQLStorageConfig] = None
 
 
 class CelerySettings(BaseModel):
@@ -136,6 +168,23 @@ if __name__ == "__main__":
           ner_service_url: "http://localhost:8001"
           dp_service_url: "http://localhost:8002"
           event_llm_service_url: "http://localhost:8003"
+        storage:
+        enabled_backends: ["jsonl"] # Example: Only enabling JSONL for now
+        jsonl:
+            output_path: "/app/data/extracted_events.jsonl" # Path for daily JSONL persistence
+        elasticsearch:
+            host: "elasticsearch" # Docker service name
+            port: 9200
+            scheme: "http"
+            index_name: "eee_events"
+            api_key: null
+        postgresql:
+            host: "postgres" # Docker service name
+            port: 5432
+            dbname: "eeedb"
+            user: "user"
+            password: "password"
+            table_name: "extracted_events"
         celery:
           broker_url: "redis://localhost:6379/0"
           result_backend: "redis://localhost:6379/0"

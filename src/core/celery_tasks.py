@@ -20,6 +20,8 @@ from src.schemas.data_models import (
 from src.utils.config_manager import ConfigManager
 from src.utils.logger import setup_logging
 from urllib.parse import urljoin  # Import urljoin for robust URL construction
+# CRITICAL FIX: Import StorageBackendFactory
+from src.storage.backends import StorageBackendFactory 
 
 # Load settings and configure logging for Celery worker
 settings = ConfigManager.get_settings()
@@ -214,6 +216,7 @@ async def process_single_document_pipeline_async(document_data: Dict[str, Any]) 
             event_llm_response = await call_event_llm_service(http_client_local, llm_input)
 
         logger.info(f"Successfully processed document {doc_id}.")
+        # Use .dict() for Celery serialization
         return {"id": doc_id, "result": event_llm_response.dict(), "success": True}
 
     except Exception as e:
@@ -227,8 +230,7 @@ def process_batch_task(self, payload_dict: Dict[str, Any]):
     """
     Celery task to process a batch of documents.
     Leverages Dask for parallel execution of single-document pipelines.
-    `http_client` is no longer passed explicitly to the Dask-submitted function
-    as it's now created within `process_single_document_pipeline_async` itself.
+    CRITICAL FIX: Persists successful results to storage backends.
     """
     payload = CeleryBatchProcessTaskPayload.parse_obj(payload_dict)
     job_id = payload.job_id
@@ -239,13 +241,9 @@ def process_batch_task(self, payload_dict: Dict[str, Any]):
     logger.info(
         f"Celery task {task_id} (Job ID: {job_id}) started processing {total_docs_in_chunk} documents.")
 
-    # No need for http_client related checks here, as it's managed per-task now.
-
     if not dask_client:
         logger.warning(
             "Dask client not initialized. Cannot run tasks in parallel. Processing sequentially.")
-        # When processing sequentially, each call to process_single_document_pipeline_async
-        # will also create and manage its own httpx.AsyncClient.
         results = []
         for doc in text_data:
             results.append(asyncio.run(
@@ -254,8 +252,6 @@ def process_batch_task(self, payload_dict: Dict[str, Any]):
         logger.info(
             f"Dispatching {total_docs_in_chunk} documents to Dask for parallel processing.")
 
-        # Dask.submit now only needs the function and document data.
-        # The http_client is handled by process_single_document_pipeline_async internally.
         futures = [dask_client.submit(
             process_single_document_pipeline_async, doc) for doc in text_data]
 
@@ -263,34 +259,59 @@ def process_batch_task(self, payload_dict: Dict[str, Any]):
         logger.info(
             f"Dask parallel processing completed for {total_docs_in_chunk} documents.")
 
-    # Prepare results for storage
-    processed_results = []
+    # Prepare results for persistence and return
+    processed_results: List[EventLLMGenerateResponse] = []
     failed_count = 0
+    
+    # CRITICAL FIX: Collect successful Pydantic objects for persistence
+    successful_pydantic_objects: List[EventLLMGenerateResponse] = []
+
     for res in results:
-        if res.get("success"):
-            if isinstance(res["result"], dict):
-                processed_results.append(
-                    EventLLMGenerateResponse.parse_obj(res["result"]))
-            else:
+        if res.get("success") and isinstance(res["result"], dict):
+            try:
+                # Parse the raw dict result back into a Pydantic model
+                llm_response_model = EventLLMGenerateResponse.parse_obj(res["result"])
+                successful_pydantic_objects.append(llm_response_model)
+                # Store the dictionary representation for Celery result serialization
+                processed_results.append(res["result"])
+            except Exception as e:
                 logger.error(
-                    f"Unexpected result type for document {res.get('id')}: {type(res['result'])}")
+                    f"Result validation failed for document {res.get('id')}: {e}", exc_info=True)
                 failed_count += 1
         else:
             failed_count += 1
             logger.error(
-                f"Document {res.get('id')} failed: {res.get('error')}")
+                f"Document {res.get('id')} failed: {res.get('error') or 'Unknown error'}")
 
+    # --- Persistence Step (CRITICAL FIX) ---
+    if successful_pydantic_objects:
+        try:
+            backends = StorageBackendFactory.get_backends()
+            for backend in backends:
+                backend.save_batch(successful_pydantic_objects)
+            logger.info(
+                f"Celery task {task_id} successfully persisted {len(successful_pydantic_objects)} results.")
+        except Exception as e:
+            logger.error(
+                f"Failed to persist batch results for Job ID {job_id}: {e}", exc_info=True)
+            # Persistence failure is a serious warning but shouldn't fail the task result itself,
+            # as the results are still available in the Celery backend for the orchestrator.
+
+    # Final counts for the Celery metadata payload
+    successful_count = len(processed_results)
+    
     logger.info(
-        f"Celery task {task_id} (Job ID: {job_id}) finished. Processed {total_docs_in_chunk - failed_count} successful, {failed_count} failed.")
+        f"Celery task {task_id} (Job ID: {job_id}) finished. Processed {successful_count} successful, {failed_count} failed.")
 
     # Return result to Celery backend
     return {
         "job_id": job_id,
         "task_id": task_id,
-        "processed_data": [r.dict() for r in processed_results],
+        # processed_data is a list of dictionaries (ready for JSON serialization)
+        "processed_data": processed_results, 
         "success": failed_count == 0,
         "error": f"{failed_count} documents failed." if failed_count > 0 else None,
-        "processed_count": total_docs_in_chunk - failed_count,
+        "processed_count": successful_count,
         "total_count": total_docs_in_chunk
     }
 

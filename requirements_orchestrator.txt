@@ -10,6 +10,8 @@ celery==5.3.6 # For dispatching tasks to Celery workers
 redis==5.0.1 # For Celery broker and backend
 python-json-logger==2.0.7
 PyYAML==6.0.1
+# Include base requirements
+-r requirements_base.txt
 # For CLI processing using Dask (if process-file uses Dask)
 dask==2024.5.1
 distributed==2024.5.1
