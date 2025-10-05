@@ -8,3 +8,5 @@ PyYAML==6.0.1
 # CRITICAL FIX: psycopg2 is needed in any container importing src/storage/backends.py for class definitions
 # Even if only the Celery Worker uses it, the orchestrator still needs the import to compile the class definition.
 psycopg2-binary==2.9.9
+# Added Click for the redesigned CLI
+click==8.1.7
