@@ -25,27 +25,26 @@ show_help() {
   echo "  down                   Stop and remove containers"
   echo "  status                 Show container statuses"
   echo "  logs [service]         Show logs for a service"
+  echo "  cli [args]             Run CLI commands inside orchestrator container"
   echo "  help                   Show this help"
   echo ""
   echo -e "${YELLOW}Modes:${NC}"
-  echo "  prod (default)         Use production config (docker-compose.yml only)"
-  echo "  dev                    Use development config (docker-compose.yml + docker-compose.dev.yml for hot-reloading)"
+  echo "  prod (default)         Use production config"
+  echo "  dev                    Use development config (hot-reloading)"
   echo ""
   echo -e "${YELLOW}Examples:${NC}"
   echo "  Start all services (prod):          ./$SCRIPT_NAME start"
   echo "  Start all services (dev):           ./$SCRIPT_NAME start dev"
   echo "  Rebuild NER service (dev):          ./$SCRIPT_NAME rebuild ner-service dev"
   echo "  Clean and rebuild all (prod):       ./$SCRIPT_NAME clean && ./$SCRIPT_NAME rebuild"
-  echo "  Rebuild LLM with no cache (dev):    ./$SCRIPT_NAME rebuild-no-cache event-llm-service dev"
-  echo "  Check service logs (prod):          ./$SCRIPT_NAME logs orchestrator-service"
+  echo "  Check service logs:                 ./$SCRIPT_NAME logs orchestrator-service"
   echo ""
-  echo -e "${YELLOW}Notes:${NC}"
-  echo "  - Commands use 'docker compose' (v2 syntax) as specified."
-  echo "  - Dev mode enables hot-reloading for API services via src volume mount and uvicorn --reload."
-  echo "  - Production mode preserves original config without src mounts or --reload to avoid regressions."
-  echo "  - For dev, ensure .env.dev is present for event-llm-service (already configured in docker-compose.yml)."
-  echo "  - Entrypoints and Dockerfiles remain unchanged; start commands are overridden only in dev mode."
-  echo "  - Run commands separately as requested (e.g., ./run.sh clean; ./run.sh rebuild dev; ./run.sh start dev)."
+  echo -e "${YELLOW}CLI Examples (via docker exec):${NC}"
+  echo "  Process single document:            ./$SCRIPT_NAME cli documents process 'Text here'"
+  echo "  Submit batch job:                   ./$SCRIPT_NAME cli documents batch /app/data/input.jsonl -o /app/data/output.jsonl"
+  echo "  Check job status:                   ./$SCRIPT_NAME cli jobs status <job-id>"
+  echo "  Health check:                       ./$SCRIPT_NAME cli admin health"
+  echo ""
   exit 0
 }
 
@@ -100,13 +99,19 @@ start_services() {
   fi
 }
 
+run_cli() {
+  local args=("$@")
+  echo -e "${BLUE}[*] Executing CLI command in orchestrator container...${NC}"
+  docker exec -it orchestrator-service python -m src.cli.main "${args[@]}"
+}
+
 # === MAIN LOGIC ===
 if [[ $# -eq 0 ]]; then
   show_help
 fi
 
 command="$1"
-mode="prod"  # Default to production to preserve original behavior
+mode="prod"
 if [[ "$2" == "dev" ]]; then
   mode="dev"
   shift 2
@@ -169,7 +174,14 @@ case "$command" in
     docker compose $compose_files logs -f "$1"
     ;;
   
+  cli)
+    run_cli "$@"
+    ;;
+  
   help|*)
     show_help
     ;;
 esac
+
+# run.sh
+# File path: run.sh
