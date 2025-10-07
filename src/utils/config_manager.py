@@ -42,7 +42,6 @@ class EventLLMServiceSettings(ServiceSettings):
         3, description="Number of retries for LLM generation if output is invalid.")
     generation_retry_delay_seconds: int = Field(
         2, description="Delay in seconds between generation retries.")
-    # FIX: Add chunking parameters to config
     chunk_size_tokens: int = Field(
         2048, description="Max token size for LLM input chunks.")
     overlap_size_tokens: int = Field(
@@ -54,11 +53,38 @@ class OrchestratorServiceSettings(ServiceSettings):
     dp_service_url: HttpUrl
     event_llm_service_url: HttpUrl
     batch_processing_chunk_size: int = 100
-    batch_processing_job_results_ttl: int = 3600  # seconds
+    batch_processing_job_results_ttl: int = 3600
     request_timeout_seconds: int = 120
 
 
-# --- CRITICAL FIX: Add Storage Configuration Models ---
+# --- CRITICAL NEW MODEL: Document Field Mapping Configuration ---
+
+class DocumentFieldMappingSettings(BaseModel):
+    """
+    Configuration for mapping diverse upstream document schemas to EEE pipeline inputs.
+    """
+    text_field: str = Field(
+        "cleaned_text",
+        description="Primary field name containing the main text to process."
+    )
+    text_field_fallbacks: List[str] = Field(
+        default_factory=lambda: ["original_text", "text", "content", "body"],
+        description="Fallback field names if primary text_field is empty/missing."
+    )
+    context_fields: List[str] = Field(
+        default_factory=list,
+        description="Fields to extract and include as context metadata in LLM prompt."
+    )
+    preserve_in_output: List[str] = Field(
+        default_factory=list,
+        description="Fields to explicitly preserve in enriched response output."
+    )
+    field_types: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Optional type hints for fields (not enforced, for documentation)."
+    )
+
+
 class JsonlStorageConfig(BaseModel):
     output_path: str = Field(...,
                              description="Full path for the JSONL output file.")
@@ -70,7 +96,6 @@ class ElasticsearchStorageConfig(BaseModel):
     scheme: str = "http"
     index_name: str
     api_key: Optional[str] = None
-    # Add other ES parameters (e.g., basic_auth) if needed
 
 
 class PostgreSQLStorageConfig(BaseModel):
@@ -109,6 +134,9 @@ class AppSettings(BaseModel):
     dp_service: DPServiceSettings
     event_llm_service: EventLLMServiceSettings
     orchestrator_service: OrchestratorServiceSettings
+    document_field_mapping: DocumentFieldMappingSettings = Field(
+        default_factory=DocumentFieldMappingSettings)
+    storage: StorageSettings = Field(default_factory=StorageSettings)
     celery: CelerySettings
 
 
