@@ -3,7 +3,7 @@
 
 general:
   log_level: INFO
-  gpu_enabled: True # Set to False if no GPU is available or you want to disable it
+  gpu_enabled: True
 
 ner_service:
   port: 8001
@@ -12,35 +12,21 @@ ner_service:
 
 dp_service:
   port: 8002
-  model_name: "en_core_web_trf" # Example spaCy transformer model
+  model_name: "en_core_web_trf"
   model_cache_dir: "/app/cache/spacy"
-
-# event_llm_service:
-#   port: 8003
-#   model_name: "google/flan-t5-large" # Example LLM model name
-#   model_path: "/app/cache/llm/flan-t5-large" # Path to your fine-tuned or downloaded LLM
-#   # Consider a smaller model if A4000 16GB RAM is a constraint for larger models
-#   # e.g., "stabilityai/stablelm-zephyr-3b" or a quantized Llama-2-7B variant
-#   model_cache_dir: "/app/cache/llm"
-#   # max_new_tokens: 512
-#   max_new_tokens: 1024
-#   temperature: 0.7
-#   top_p: 0.9
-
 
 event_llm_service:
   port: 8003
-  model_name: "mistralai/Mistral-7B-Instruct-v0.2" # CHANGED MODEL NAME
-  model_path: "/app/cache/llm/mistral-7b-instruct-v0.2" # Path to your fine-tuned or downloaded LLM
+  model_name: "mistralai/Mistral-7B-Instruct-v0.2"
+  model_path: "/app/cache/llm/mistral-7b-instruct-v0.2"
   model_cache_dir: "/app/cache/llm"
-  request_timeout_seconds: 900 # Timeout for requests to the Event LLM service in seconds
-  max_new_tokens: 4096 # Keeping this as you expect large output
+  request_timeout_seconds: 900
+  max_new_tokens: 8192  # Changed from 4096 to 8192
   temperature: 0.7
   top_p: 0.9
-  generation_max_retries: 3 # Number of retries if JSON parsing fails
-  generation_retry_delay_seconds: 2 # Delay in seconds between retries
-  # FIX: Chunking parameters added
-  chunk_size_tokens: 2048 
+  generation_max_retries: 3
+  generation_retry_delay_seconds: 2
+  chunk_size_tokens: 2048
   overlap_size_tokens: 128
 
 orchestrator_service:
@@ -48,42 +34,77 @@ orchestrator_service:
   ner_service_url: "http://ner-service:8001"
   dp_service_url: "http://dp-service:8002"
   event_llm_service_url: "http://event-llm-service:8003"
-  batch_processing_chunk_size: 100 # Number of documents to process in one Celery task
-  batch_processing_job_results_ttl: 3600 # seconds (1 hour)
-  request_timeout_seconds: 300 # Timeout for requests to the orchestrator service in seconds
+  batch_processing_chunk_size: 100
+  batch_processing_job_results_ttl: 3600
+  request_timeout_seconds: 300
+
+# ===========================
+# CRITICAL NEW SECTION: Document Field Mapping
+# ===========================
+document_field_mapping:
+  # Which field contains the main text to process
+  text_field: "cleaned_text"  # Change to match your upstream structure
+  
+  # Optional: Alternative text fields (fallback chain if primary is empty/missing)
+  text_field_fallbacks: ["original_text", "text", "content", "body"]
+  
+  # Context fields to include in LLM prompt (if available in document)
+  # These enrich the prompt with additional information
+  context_fields:
+    - "cleaned_title"              # Document title
+    - "cleaned_excerpt"            # Summary/excerpt
+    - "cleaned_author"             # Author name
+    - "cleaned_publication_date"   # Publication date
+    - "cleaned_source_url"         # Source URL
+    - "cleaned_categories"         # Categories/topics
+    - "cleaned_tags"               # Tags
+    - "temporal_metadata"          # Temporal context
+    - "entities"                   # Pre-extracted entities (will merge with NER)
+  
+  # Fields to preserve in response (pass-through)
+  # All fields not listed here are still preserved in source_document
+  preserve_in_output:
+    - "document_id"
+    - "version"
+    - "cleaned_publication_date"
+    - "cleaned_source_url"
+    - "cleaned_word_count"
+  
+  # Optional: Field type hints for validation (not enforced, just for documentation)
+  field_types:
+    cleaned_text: "str"
+    cleaned_title: "str"
+    cleaned_word_count: "int"
+    entities: "list[dict]"
+    cleaned_additional_metadata: "dict"
 
 
 storage:
-  enabled_backends: ["jsonl"] # Example: Only enabling JSONL for now
-  
+  enabled_backends: ["jsonl"]
   jsonl:
-    output_path: "/app/data/extracted_events.jsonl" # Path for daily JSONL persistence
-
+    output_path: "/app/data/extracted_events.jsonl"
   elasticsearch:
-    host: "elasticsearch" # Docker service name
+    host: "elasticsearch"
     port: 9200
     scheme: "http"
     index_name: "eee_events"
     api_key: null
-
   postgresql:
-    host: "postgres" # Docker service name
+    host: "postgres"
     port: 5432
     dbname: "eeedb"
     user: "user"
     password: "password"
     table_name: "extracted_events"
 
-
 celery:
   broker_url: "redis://redis:6379/0"
   result_backend: "redis://redis:6379/0"
-  task_acks_late: True # Task is not acknowledged until it's actually finished
-  worker_prefetch_multiplier: 1 # Workers only take one task at a time for long-running jobs
-  # For Dask integration within Celery worker
-  dask_local_cluster_n_workers: null # null or number of workers (e.g., 22 for Threadripper PRO 5945WX)
-  dask_local_cluster_threads_per_worker: 1 # Typically 1 thread per worker for CPU-bound tasks
-  dask_local_cluster_memory_limit: "150GB" # e.g., 150GB for 160GB RAM, leave some for OS
+  task_acks_late: True
+  worker_prefetch_multiplier: 1
+  dask_local_cluster_n_workers: null
+  dask_local_cluster_threads_per_worker: 1
+  dask_local_cluster_memory_limit: "150GB"
 
 logging:
   version: 1
@@ -101,31 +122,31 @@ logging:
       class: logging.handlers.RotatingFileHandler
       formatter: json
       filename: /app/logs/ner_service.jsonl
-      maxBytes: 10485760 # 10 MB
+      maxBytes: 10485760
       backupCount: 5
     dp_file:
       class: logging.handlers.RotatingFileHandler
       formatter: json
       filename: /app/logs/dp_service.jsonl
-      maxBytes: 10485760 # 10 MB
+      maxBytes: 10485760
       backupCount: 5
     event_llm_file:
       class: logging.handlers.RotatingFileHandler
       formatter: json
       filename: /app/logs/event_llm_service.jsonl
-      maxBytes: 10485760 # 10 MB
+      maxBytes: 10485760
       backupCount: 5
     orchestrator_file:
       class: logging.handlers.RotatingFileHandler
       formatter: json
       filename: /app/logs/orchestrator_service.jsonl
-      maxBytes: 10485760 # 10 MB
+      maxBytes: 10485760
       backupCount: 5
     celery_file:
       class: logging.handlers.RotatingFileHandler
       formatter: json
       filename: /app/logs/celery_worker.jsonl
-      maxBytes: 10485760 # 10 MB
+      maxBytes: 10485760
       backupCount: 5
   root:
     handlers: [console]
@@ -141,7 +162,7 @@ logging:
       propagate: False
     event_llm_service:
       handlers: [event_llm_file, console]
-      level: DEBUG # Changed to DEBUG for more detailed logs
+      level: DEBUG
       propagate: False
     orchestrator_service:
       handlers: [orchestrator_file, console]
@@ -151,3 +172,158 @@ logging:
       handlers: [celery_file, console]
       level: DEBUG
       propagate: False
+
+
+# config/settings.yaml
+# File path: config/settings.yaml
+
+# general:
+#   log_level: INFO
+#   gpu_enabled: True # Set to False if no GPU is available or you want to disable it
+
+# ner_service:
+#   port: 8001
+#   model_name: "Babelscape/wikineural-multilingual-ner"
+#   model_cache_dir: "/app/cache/hf"
+
+# dp_service:
+#   port: 8002
+#   model_name: "en_core_web_trf" # Example spaCy transformer model
+#   model_cache_dir: "/app/cache/spacy"
+
+# # event_llm_service:
+# #   port: 8003
+# #   model_name: "google/flan-t5-large" # Example LLM model name
+# #   model_path: "/app/cache/llm/flan-t5-large" # Path to your fine-tuned or downloaded LLM
+# #   # Consider a smaller model if A4000 16GB RAM is a constraint for larger models
+# #   # e.g., "stabilityai/stablelm-zephyr-3b" or a quantized Llama-2-7B variant
+# #   model_cache_dir: "/app/cache/llm"
+# #   # max_new_tokens: 512
+# #   max_new_tokens: 1024
+# #   temperature: 0.7
+# #   top_p: 0.9
+
+
+# event_llm_service:
+#   port: 8003
+#   model_name: "mistralai/Mistral-7B-Instruct-v0.2" # CHANGED MODEL NAME
+#   model_path: "/app/cache/llm/mistral-7b-instruct-v0.2" # Path to your fine-tuned or downloaded LLM
+#   model_cache_dir: "/app/cache/llm"
+#   request_timeout_seconds: 900 # Timeout for requests to the Event LLM service in seconds
+#   max_new_tokens: 4096 # Keeping this as you expect large output
+#   temperature: 0.7
+#   top_p: 0.9
+#   generation_max_retries: 3 # Number of retries if JSON parsing fails
+#   generation_retry_delay_seconds: 2 # Delay in seconds between retries
+#   # FIX: Chunking parameters added
+#   chunk_size_tokens: 2048 
+#   overlap_size_tokens: 128
+
+# orchestrator_service:
+#   port: 8000
+#   ner_service_url: "http://ner-service:8001"
+#   dp_service_url: "http://dp-service:8002"
+#   event_llm_service_url: "http://event-llm-service:8003"
+#   batch_processing_chunk_size: 100 # Number of documents to process in one Celery task
+#   batch_processing_job_results_ttl: 3600 # seconds (1 hour)
+#   request_timeout_seconds: 300 # Timeout for requests to the orchestrator service in seconds
+
+
+# storage:
+#   enabled_backends: ["jsonl"] # Example: Only enabling JSONL for now
+  
+#   jsonl:
+#     output_path: "/app/data/extracted_events.jsonl" # Path for daily JSONL persistence
+
+#   elasticsearch:
+#     host: "elasticsearch" # Docker service name
+#     port: 9200
+#     scheme: "http"
+#     index_name: "eee_events"
+#     api_key: null
+
+#   postgresql:
+#     host: "postgres" # Docker service name
+#     port: 5432
+#     dbname: "eeedb"
+#     user: "user"
+#     password: "password"
+#     table_name: "extracted_events"
+
+
+# celery:
+#   broker_url: "redis://redis:6379/0"
+#   result_backend: "redis://redis:6379/0"
+#   task_acks_late: True # Task is not acknowledged until it's actually finished
+#   worker_prefetch_multiplier: 1 # Workers only take one task at a time for long-running jobs
+#   # For Dask integration within Celery worker
+#   dask_local_cluster_n_workers: null # null or number of workers (e.g., 22 for Threadripper PRO 5945WX)
+#   dask_local_cluster_threads_per_worker: 1 # Typically 1 thread per worker for CPU-bound tasks
+#   dask_local_cluster_memory_limit: "150GB" # e.g., 150GB for 160GB RAM, leave some for OS
+
+# logging:
+#   version: 1
+#   disable_existing_loggers: False
+#   formatters:
+#     json:
+#       class: pythonjsonlogger.jsonlogger.JsonFormatter
+#       format: "%(levelname)s %(asctime)s %(filename)s %(funcName)s %(lineno)d %(message)s"
+#   handlers:
+#     console:
+#       class: logging.StreamHandler
+#       formatter: json
+#       stream: ext://sys.stdout
+#     ner_file:
+#       class: logging.handlers.RotatingFileHandler
+#       formatter: json
+#       filename: /app/logs/ner_service.jsonl
+#       maxBytes: 10485760 # 10 MB
+#       backupCount: 5
+#     dp_file:
+#       class: logging.handlers.RotatingFileHandler
+#       formatter: json
+#       filename: /app/logs/dp_service.jsonl
+#       maxBytes: 10485760 # 10 MB
+#       backupCount: 5
+#     event_llm_file:
+#       class: logging.handlers.RotatingFileHandler
+#       formatter: json
+#       filename: /app/logs/event_llm_service.jsonl
+#       maxBytes: 10485760 # 10 MB
+#       backupCount: 5
+#     orchestrator_file:
+#       class: logging.handlers.RotatingFileHandler
+#       formatter: json
+#       filename: /app/logs/orchestrator_service.jsonl
+#       maxBytes: 10485760 # 10 MB
+#       backupCount: 5
+#     celery_file:
+#       class: logging.handlers.RotatingFileHandler
+#       formatter: json
+#       filename: /app/logs/celery_worker.jsonl
+#       maxBytes: 10485760 # 10 MB
+#       backupCount: 5
+#   root:
+#     handlers: [console]
+#     level: INFO
+#   loggers:
+#     ner_service:
+#       handlers: [ner_file, console]
+#       level: INFO
+#       propagate: False
+#     dp_service:
+#       handlers: [dp_file, console]
+#       level: INFO
+#       propagate: False
+#     event_llm_service:
+#       handlers: [event_llm_file, console]
+#       level: DEBUG # Changed to DEBUG for more detailed logs
+#       propagate: False
+#     orchestrator_service:
+#       handlers: [orchestrator_file, console]
+#       level: DEBUG
+#       propagate: False
+#     celery_worker:
+#       handlers: [celery_file, console]
+#       level: DEBUG
+#       propagate: False
