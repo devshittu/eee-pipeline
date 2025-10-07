@@ -8,10 +8,12 @@ import math
 import redis
 from fastapi import FastAPI, HTTPException, status, BackgroundTasks
 from pydantic import ValidationError
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 from urllib.parse import urljoin
 from src.schemas.data_models import (
     ProcessTextRequest, ProcessTextResponse,
+    EnrichedDocumentRequest, EnrichedDocumentResponse,
+    EnrichedBatchRequest,
     NERPredictRequest, NERPredictResponse,
     DPExtractSOARequest, DPExtractSOAResponse,
     EventLLMInput, EventLLMGenerateResponse,
@@ -21,13 +23,14 @@ from src.schemas.data_models import (
 from src.core.celery_tasks import celery_app, process_batch_task
 from src.utils.config_manager import ConfigManager
 from src.utils.logger import setup_logging
+from src.utils.document_processor import DocumentProcessor
 
 # Load settings and configure logging
 settings = ConfigManager.get_settings()
 setup_logging()
 logger = logging.getLogger("orchestrator_service")
 
-# Initialize FastAPI app with versioned prefix
+# Initialize FastAPI app
 app = FastAPI(
     title="EEE Pipeline Orchestrator Service",
     description="Central entry point for the Event & Entity Extraction pipeline, orchestrating microservices.",
@@ -42,6 +45,9 @@ http_client = httpx.AsyncClient(timeout=600.0)
 # Initialize Redis client for job metadata
 redis_client = redis.Redis.from_url(
     settings.celery.broker_url, decode_responses=True)
+
+# Initialize document processor for enriched requests
+document_processor = DocumentProcessor()
 
 
 @app.on_event("startup")
@@ -78,10 +84,7 @@ async def shutdown_event():
 
 @app.get("/health", status_code=status.HTTP_200_OK)
 async def health_check():
-    """
-    Health check endpoint.
-    Checks connectivity to all dependent services and Celery broker/backend.
-    """
+    """Health check endpoint."""
     try:
         ner_url = urljoin(
             str(settings.orchestrator_service.ner_service_url), "health")
@@ -134,12 +137,7 @@ async def health_check():
 @app.post("/v1/documents", response_model=ProcessTextResponse, status_code=status.HTTP_200_OK)
 async def process_document(request: ProcessTextRequest):
     """
-    Processes a single document (text string) through the full pipeline.
-    Orchestrates calls to ner-service, dp-service, and event-llm-service.
-    Returns the combined, standardized JSON output synchronously.
-    
-    **Route Convention**: POST /v1/documents (RESTful resource creation)
-    **Formerly**: POST /process-text
+    Processes a single document (simple text string) through the full pipeline.
     """
     text = request.text
     logger.info(
@@ -149,10 +147,7 @@ async def process_document(request: ProcessTextRequest):
         # 1. Call NER Service
         ner_url = urljoin(
             str(settings.orchestrator_service.ner_service_url), "predict")
-        ner_response = await http_client.post(
-            ner_url,
-            json={"text": text}
-        )
+        ner_response = await http_client.post(ner_url, json={"text": text})
         ner_response.raise_for_status()
         ner_results = NERPredictResponse.parse_obj(ner_response.json())
         logger.debug(
@@ -161,30 +156,25 @@ async def process_document(request: ProcessTextRequest):
         # 2. Call DP Service
         dp_url = urljoin(
             str(settings.orchestrator_service.dp_service_url), "extract-soa")
-        dp_response = await http_client.post(
-            dp_url,
-            json={"text": text}
-        )
+        dp_response = await http_client.post(dp_url, json={"text": text})
         dp_response.raise_for_status()
         dp_results = DPExtractSOAResponse.parse_obj(dp_response.json())
         logger.debug(
             f"DP service responded with {len(dp_results.soa_triplets)} S-O-A triplets.")
 
-        # 3. Prepare input for Event LLM Service
+        # 3. Prepare input for Event LLM Service (no context metadata for simple request)
         llm_input = EventLLMInput(
             text=text,
             ner_entities=ner_results.entities,
-            soa_triplets=dp_results.soa_triplets
+            soa_triplets=dp_results.soa_triplets,
+            context_metadata=None
         )
         logger.debug("Prepared input for Event LLM service.")
 
         # 4. Call Event LLM Service
         llm_url = urljoin(
             str(settings.orchestrator_service.event_llm_service_url), "generate-events")
-        llm_response = await http_client.post(
-            llm_url,
-            json=llm_input.dict()
-        )
+        llm_response = await http_client.post(llm_url, json=llm_input.dict())
         llm_response.raise_for_status()
         final_output = EventLLMGenerateResponse.parse_obj(llm_response.json())
         logger.info(
@@ -214,23 +204,138 @@ async def process_document(request: ProcessTextRequest):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error.")
 
 
+# ===========================
+# CRITICAL NEW ENDPOINT: Enriched Document Processing
+# ===========================
+
+@app.post("/v1/documents/enriched", response_model=EnrichedDocumentResponse, status_code=status.HTTP_200_OK)
+async def process_enriched_document(request: EnrichedDocumentRequest):
+    """
+    Processes a document with rich metadata structure.
+    Extracts text based on configured field mapping and uses context fields to enhance LLM prompting.
+    
+    **Route Convention**: POST /v1/documents/enriched (RESTful enriched resource creation)
+    **New in v1.1**: Supports flexible upstream schemas with configurable field mapping
+    """
+    raw_document = request.dict()
+    logger.info(
+        f"Received enriched document with fields: {list(raw_document.keys())}")
+
+    try:
+        # Extract text and context using document processor
+        enriched_input = document_processor.prepare_enriched_input(
+            raw_document)
+        text = enriched_input["text"]
+        context_metadata = enriched_input["context_metadata"]
+        upstream_entities = enriched_input["upstream_entities"]
+        source_document = enriched_input["source_document"]
+
+        logger.info(
+            f"Extracted text (len: {len(text)}), context fields: {list(context_metadata.keys())}")
+
+        # 1. Call NER Service
+        ner_url = urljoin(
+            str(settings.orchestrator_service.ner_service_url), "predict")
+        ner_response = await http_client.post(ner_url, json={"text": text})
+        ner_response.raise_for_status()
+        ner_results = NERPredictResponse.parse_obj(ner_response.json())
+        logger.debug(
+            f"NER service responded with {len(ner_results.entities)} entities.")
+
+        # Merge upstream entities with NER entities
+        merged_entities = document_processor.merge_entities(
+            upstream_entities,
+            [e.dict() for e in ner_results.entities]
+        )
+        logger.info(f"Merged entities: {len(merged_entities)} total")
+
+        # 2. Call DP Service
+        dp_url = urljoin(
+            str(settings.orchestrator_service.dp_service_url), "extract-soa")
+        dp_response = await http_client.post(dp_url, json={"text": text})
+        dp_response.raise_for_status()
+        dp_results = DPExtractSOAResponse.parse_obj(dp_response.json())
+        logger.debug(
+            f"DP service responded with {len(dp_results.soa_triplets)} S-O-A triplets.")
+
+        # 3. Prepare input for Event LLM Service with context metadata
+        from src.schemas.data_models import Entity
+        llm_input = EventLLMInput(
+            text=text,
+            ner_entities=[Entity.parse_obj(e) for e in merged_entities],
+            soa_triplets=dp_results.soa_triplets,
+            context_metadata=context_metadata  # CRITICAL: Pass context
+        )
+        logger.debug(
+            f"Prepared enriched input for Event LLM service with {len(context_metadata)} context fields.")
+
+        # 4. Call Event LLM Service
+        llm_url = urljoin(
+            str(settings.orchestrator_service.event_llm_service_url), "generate-events")
+        llm_response = await http_client.post(llm_url, json=llm_input.dict())
+        llm_response.raise_for_status()
+        final_output = EventLLMGenerateResponse.parse_obj(llm_response.json())
+        logger.info(f"Successfully processed enriched document.")
+
+        # Return enriched response with source document preserved
+        return EnrichedDocumentResponse(
+            **final_output.dict(),
+            source_document=source_document
+        )
+
+    except ValueError as e:
+        # Document processor validation errors (missing text field, etc.)
+        logger.warning(f"Document validation error: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"Document validation error: {str(e)}")
+    except ValidationError as e:
+        logger.warning(
+            f"Invalid request/response payload: {e.errors()}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"Invalid data format: {e.errors()}")
+    except httpx.HTTPStatusError as e:
+        logger.error(
+            f"Error from upstream service {e.response.url}: {e.response.status_code} - {e.response.text}", exc_info=True)
+        raise HTTPException(status_code=e.response.status_code,
+                            detail=f"Upstream service error: {e.response.text}")
+    except httpx.RequestError as e:
+        logger.error(
+            f"Network error calling upstream service {e.request.url}: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail=f"Could not reach upstream service: {e.request.url}")
+    except Exception as e:
+        logger.error(
+            f"Internal server error during enriched document processing: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error.")
+
+
 @app.post("/v1/documents/batch", response_model=Dict[str, str], status_code=status.HTTP_202_ACCEPTED)
-async def submit_batch_job(request: ProcessBatchRequest, background_tasks: BackgroundTasks):
+async def submit_batch_job(request: Union[ProcessBatchRequest, EnrichedBatchRequest], background_tasks: BackgroundTasks):
     """
     Submits a batch of documents for asynchronous processing.
-    Returns a job_id for status tracking via GET /v1/jobs/{job_id}.
+    Supports both simple text arrays and enriched document arrays.
     
     **Route Convention**: POST /v1/documents/batch (RESTful batch resource creation)
-    **Formerly**: POST /process-batch
     """
     job_id = request.job_id
-    texts_to_process = [{"id": f"{job_id}-{i}", "text": text}
-                        for i, text in enumerate(request.texts)]
-    chunk_size = settings.orchestrator_service.batch_processing_chunk_size
 
+    # Detect request type and prepare payload
+    if isinstance(request, ProcessBatchRequest):
+        # Simple text batch
+        texts_to_process = [{"id": f"{job_id}-{i}", "text": text, "enriched": False}
+                            for i, text in enumerate(request.texts)]
+        logger.info(
+            f"Received simple batch request for Job ID {job_id} with {len(request.texts)} texts.")
+    else:
+        # Enriched document batch
+        texts_to_process = [{"id": f"{job_id}-{i}", "document": doc, "enriched": True}
+                            for i, doc in enumerate(request.documents)]
+        logger.info(
+            f"Received enriched batch request for Job ID {job_id} with {len(request.documents)} documents.")
+
+    chunk_size = settings.orchestrator_service.batch_processing_chunk_size
     total_chunks = math.ceil(len(texts_to_process) / chunk_size)
-    logger.info(
-        f"Received batch request for Job ID {job_id} with {len(texts_to_process)} documents, splitting into {total_chunks} chunks.")
 
     task_ids = []
     try:
@@ -272,10 +377,6 @@ async def submit_batch_job(request: ProcessBatchRequest, background_tasks: Backg
 async def get_job_status(job_id: str):
     """
     Returns the status and results of a batch processing job.
-    Aggregates results from all Celery tasks associated with the job_id.
-    
-    **Route Convention**: GET /v1/jobs/{job_id} (RESTful job resource retrieval)
-    **Formerly**: GET /status/{job_id}
     """
     logger.info(f"Received status request for Job ID {job_id}.")
 
@@ -315,10 +416,24 @@ async def get_job_status(job_id: str):
         progress = processed_items / total_items if total_items > 0 else 0.0
         status_str = "SUCCESS" if all_success and all_completed else "FAILURE" if errors else "PENDING"
 
+        # Parse results as either EventLLMGenerateResponse or EnrichedDocumentResponse
+        parsed_results = []
+        for r in results:
+            try:
+                if "source_document" in r:
+                    parsed_results.append(
+                        EnrichedDocumentResponse.parse_obj(r))
+                else:
+                    parsed_results.append(
+                        EventLLMGenerateResponse.parse_obj(r))
+            except Exception as e:
+                logger.error(f"Failed to parse result: {e}", exc_info=True)
+                continue
+
         return BatchJobStatusResponse(
             job_id=job_id,
             status=status_str,
-            results=[EventLLMGenerateResponse.parse_obj(r) for r in results],
+            results=parsed_results,
             error="; ".join(errors) if errors else None,
             progress=progress,
             total_items=total_items,
@@ -342,10 +457,7 @@ async def get_job_status(job_id: str):
 
 @app.post("/process-text", response_model=ProcessTextResponse, status_code=status.HTTP_200_OK, deprecated=True)
 async def legacy_process_text(request: ProcessTextRequest):
-    """
-    **DEPRECATED**: Use POST /v1/documents instead.
-    This endpoint is maintained for backward compatibility and will be removed in v2.0.
-    """
+    """**DEPRECATED**: Use POST /v1/documents instead."""
     logger.warning(
         "Legacy endpoint /process-text called. Redirecting to /v1/documents.")
     return await process_document(request)
@@ -353,10 +465,7 @@ async def legacy_process_text(request: ProcessTextRequest):
 
 @app.post("/process-batch", response_model=Dict[str, str], status_code=status.HTTP_202_ACCEPTED, deprecated=True)
 async def legacy_process_batch(request: ProcessBatchRequest, background_tasks: BackgroundTasks):
-    """
-    **DEPRECATED**: Use POST /v1/documents/batch instead.
-    This endpoint is maintained for backward compatibility and will be removed in v2.0.
-    """
+    """**DEPRECATED**: Use POST /v1/documents/batch instead."""
     logger.warning(
         "Legacy endpoint /process-batch called. Redirecting to /v1/documents/batch.")
     return await submit_batch_job(request, background_tasks)
@@ -364,14 +473,10 @@ async def legacy_process_batch(request: ProcessBatchRequest, background_tasks: B
 
 @app.get("/status/{job_id}", response_model=BatchJobStatusResponse, status_code=status.HTTP_200_OK, deprecated=True)
 async def legacy_get_status(job_id: str):
-    """
-    **DEPRECATED**: Use GET /v1/jobs/{job_id} instead.
-    This endpoint is maintained for backward compatibility and will be removed in v2.0.
-    """
+    """**DEPRECATED**: Use GET /v1/jobs/{job_id} instead."""
     logger.warning(
         f"Legacy endpoint /status/{job_id} called. Redirecting to /v1/jobs/{job_id}.")
     return await get_job_status(job_id)
-
 
 # src/api/orchestrator_service.py
 # File path: src/api/orchestrator_service.py
