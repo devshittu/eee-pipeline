@@ -4,6 +4,8 @@
 """
 CLI for the Event and Entity Extraction (EEE) Pipeline.
 Uses Click framework for intuitive command structure and developer experience.
+
+CRITICAL ENHANCEMENT: Supports enriched document processing with flexible schemas.
 """
 
 import asyncio
@@ -20,8 +22,11 @@ from src.utils.logger import setup_logging
 from src.schemas.data_models import (
     ProcessTextRequest,
     ProcessBatchRequest,
+    EnrichedDocumentRequest,
+    EnrichedBatchRequest,
     BatchJobStatusResponse,
-    EventLLMGenerateResponse
+    EventLLMGenerateResponse,
+    EnrichedDocumentResponse
 )
 from src.storage.backends import StorageBackendFactory
 
@@ -39,14 +44,16 @@ orchestrator_url = f"http://localhost:{settings.orchestrator_service.port}"
 # ===========================
 
 @click.group()
-@click.version_option(version="1.0.0", prog_name="eee-cli")
+@click.version_option(version="1.1.0", prog_name="eee-cli")
 @click.pass_context
 def cli(ctx):
     """
     Event & Entity Extraction (EEE) Pipeline CLI.
-    
+
     Provides commands for processing documents, managing batch jobs,
     and administering the pipeline services.
+
+    New in v1.1: Support for enriched documents with flexible schemas.
     """
     ctx.ensure_object(dict)
     ctx.obj['orchestrator_url'] = orchestrator_url
@@ -67,32 +74,53 @@ def documents():
 @click.pass_context
 def process_document(ctx, text: str):
     """
-    Process a single document synchronously.
-    
+    Process a single document synchronously (simple text).
+
     TEXT: The input text string to process through the EEE pipeline.
-    
+
     Example:
         eee-cli documents process "The UK government licensed its new AI tool..."
     """
     asyncio.run(_process_single_async(ctx.obj['orchestrator_url'], text))
 
 
+@documents.command(name="process-enriched")
+@click.argument("json_file", type=click.Path(exists=True))
+@click.pass_context
+def process_enriched_document(ctx, json_file: str):
+    """
+    Process a single enriched document with metadata from JSON file.
+
+    JSON_FILE: Path to a JSON file containing the enriched document structure.
+
+    Example:
+        eee-cli documents process-enriched enriched_doc.json
+    """
+    asyncio.run(_process_enriched_async(
+        ctx.obj['orchestrator_url'], json_file))
+
+
 @documents.command(name="batch")
 @click.argument("input_file", type=click.Path(exists=True))
 @click.option("--output", "-o", type=click.Path(), required=True,
               help="Path to save the aggregated results (JSONL format).")
+@click.option("--enriched", is_flag=True, default=False,
+              help="Treat input as enriched documents (JSONL with full document objects).")
 @click.pass_context
-def process_batch(ctx, input_file: str, output: str):
+def process_batch(ctx, input_file: str, output: str, enriched: bool):
     """
     Submit a batch of documents for asynchronous processing.
-    
-    INPUT_FILE: Path to a JSONL file where each line is {"text": "..."}
-    
-    Example:
-        eee-cli documents batch input.jsonl --output results.jsonl
+
+    INPUT_FILE: Path to a JSONL file where each line is:
+        - Simple mode: {"text": "..."}
+        - Enriched mode: {full document object with configured fields}
+
+    Examples:
+        Simple:   eee-cli documents batch input.jsonl --output results.jsonl
+        Enriched: eee-cli documents batch enriched.jsonl --output results.jsonl --enriched
     """
     asyncio.run(_process_batch_async(
-        ctx.obj['orchestrator_url'], input_file, output))
+        ctx.obj['orchestrator_url'], input_file, output, enriched))
 
 
 # ===========================
@@ -111,9 +139,9 @@ def jobs():
 def job_status(ctx, job_id: str):
     """
     Check the status of a batch processing job.
-    
+
     JOB_ID: The unique identifier for the batch job.
-    
+
     Example:
         eee-cli jobs status abc123-def456
     """
@@ -129,9 +157,9 @@ def job_status(ctx, job_id: str):
 def job_results(ctx, job_id: str, output: Optional[str]):
     """
     Retrieve results from a completed batch job.
-    
+
     JOB_ID: The unique identifier for the batch job.
-    
+
     Example:
         eee-cli jobs results abc123-def456 --output results.jsonl
     """
@@ -151,12 +179,7 @@ def admin():
 
 @admin.command(name="download-models")
 def download_models():
-    """
-    Pre-download all required models for offline use.
-    
-    Note: Models are typically downloaded during service startup.
-    This command is for manual pre-caching.
-    """
+    """Pre-download all required models for offline use."""
     click.echo(
         "Model download triggered. Models download during service startup (see Docker entrypoints).")
     logger.info("Model download command executed.")
@@ -165,13 +188,21 @@ def download_models():
 @admin.command(name="health")
 @click.pass_context
 def health_check(ctx):
-    """
-    Check the health of all pipeline services.
-    
-    Example:
-        eee-cli admin health
-    """
+    """Check the health of all pipeline services."""
     asyncio.run(_health_check_async(ctx.obj['orchestrator_url']))
+
+
+@admin.command(name="show-config")
+def show_config():
+    """Display current document field mapping configuration."""
+    from src.utils.config_manager import ConfigManager
+    config = ConfigManager.get_settings().document_field_mapping
+
+    click.echo("=== Document Field Mapping Configuration ===")
+    click.echo(f"Text Field: {config.text_field}")
+    click.echo(f"Fallback Fields: {', '.join(config.text_field_fallbacks)}")
+    click.echo(f"Context Fields: {', '.join(config.context_fields)}")
+    click.echo(f"Preserve in Output: {', '.join(config.preserve_in_output)}")
 
 
 # ===========================
@@ -215,13 +246,58 @@ async def _process_single_async(orchestrator_url: str, text: str):
             click.echo(f"Unexpected error: {e}", err=True)
 
 
-async def _process_batch_async(orchestrator_url: str, input_path: str, output_path: str):
+async def _process_enriched_async(orchestrator_url: str, json_file: str):
+    """Processes an enriched document from JSON file."""
+    async with httpx.AsyncClient(timeout=600.0) as client:
+        try:
+            with open(json_file, 'r', encoding='utf-8') as f:
+                document = json.load(f)
+
+            logger.info(
+                f"Sending enriched document from {json_file} to orchestrator.")
+            response = await client.post(
+                f"{orchestrator_url}/v1/documents/enriched",
+                json=document
+            )
+            response.raise_for_status()
+            result_dict = response.json()
+
+            final_output = EnrichedDocumentResponse.parse_obj(result_dict)
+            backends = StorageBackendFactory.get_backends()
+
+            for backend in backends:
+                backend.save(final_output)
+
+            logger.info(
+                "Successfully processed and persisted enriched document.")
+            click.echo(json.dumps(final_output.model_dump(),
+                       indent=2, ensure_ascii=False))
+
+        except FileNotFoundError:
+            click.echo(f"Error: File not found: {json_file}", err=True)
+        except json.JSONDecodeError as e:
+            click.echo(f"Error: Invalid JSON in file: {e}", err=True)
+        except httpx.HTTPStatusError as e:
+            logger.error(
+                f"HTTP error: {e.response.status_code} - {e.response.text}", exc_info=True)
+            click.echo(
+                f"Error: {e.response.status_code} - {e.response.text}", err=True)
+        except httpx.RequestError as e:
+            logger.error(f"Network error: {e}", exc_info=True)
+            click.echo(f"Network error: {e}", err=True)
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}", exc_info=True)
+            click.echo(f"Unexpected error: {e}", err=True)
+
+
+async def _process_batch_async(orchestrator_url: str, input_path: str, output_path: str, enriched: bool):
     """Processes a batch file via orchestrator and polls for completion."""
     if not os.path.exists(input_path):
         click.echo(f"Error: Input file not found at {input_path}", err=True)
         return
 
-    logger.info(f"Starting batch processing for file: {input_path}")
+    logger.info(
+        f"Starting batch processing for file: {input_path} (enriched={enriched})")
 
     dask_n_workers = settings.celery.dask_local_cluster_n_workers or os.cpu_count()
     cluster = None
@@ -236,34 +312,41 @@ async def _process_batch_async(orchestrator_url: str, input_path: str, output_pa
             dashboard_address=None
         )
         client_obj = Client(cluster)
-        logger.info(
-            f"Dask LocalCluster initialized for CLI: {client_obj.dashboard_link if client_obj.dashboard_link else 'N/A'}")
+        logger.info(f"Dask LocalCluster initialized for CLI")
 
         def parse_json_line(line):
             try:
-                data = json.loads(line)
-                return data.get("text")
+                return json.loads(line)
             except json.JSONDecodeError as e:
                 logger.warning(
                     f"Skipping malformed JSON line: {line[:100]}... Error: {e}")
                 return None
 
-        texts_only = db.read_text(input_path).map(
+        documents = db.read_text(input_path).map(
             parse_json_line).filter(lambda x: x is not None).compute()
 
-        if not texts_only:
-            click.echo("No valid texts found in the input file.", err=True)
+        if not documents:
+            click.echo("No valid documents found in the input file.", err=True)
             return
 
-        logger.info(
-            f"Initiating batch processing for {len(texts_only)} documents via orchestrator.")
+        logger.info(f"Loaded {len(documents)} documents from file.")
 
         async with httpx.AsyncClient(timeout=600.0) as http_client:
-            batch_request = ProcessBatchRequest(texts=texts_only)
-            response = await http_client.post(
-                f"{orchestrator_url}/v1/documents/batch",
-                json=batch_request.model_dump()
-            )
+            if enriched:
+                # Enriched batch request
+                batch_request = EnrichedBatchRequest(documents=documents)
+                endpoint = f"{orchestrator_url}/v1/documents/batch"
+            else:
+                # Simple batch request - extract text field
+                texts = [doc.get("text", "") for doc in documents]
+                texts = [t for t in texts if t]  # Filter empty
+                if not texts:
+                    click.echo("No valid texts found in documents.", err=True)
+                    return
+                batch_request = ProcessBatchRequest(texts=texts)
+                endpoint = f"{orchestrator_url}/v1/documents/batch"
+
+            response = await http_client.post(endpoint, json=batch_request.model_dump())
             response.raise_for_status()
             batch_info = response.json()
             job_id = batch_info["job_id"]
@@ -337,18 +420,17 @@ async def _poll_batch_status(client: httpx.AsyncClient, orchestrator_url: str, j
 
         except httpx.HTTPStatusError as e:
             logger.error(
-                f"HTTP error polling status for job {job_id}: {e.response.status_code}", exc_info=True)
+                f"HTTP error polling status: {e.response.status_code}", exc_info=True)
             click.echo(
                 f"Error polling status: {e.response.status_code} - {e.response.text}", err=True)
             break
         except httpx.RequestError as e:
-            logger.error(
-                f"Network error polling status for job {job_id}: {e}", exc_info=True)
+            logger.error(f"Network error polling status: {e}", exc_info=True)
             click.echo(f"Network error: {e}", err=True)
             break
         except Exception as e:
             logger.error(
-                f"Unexpected error polling status for job {job_id}: {e}", exc_info=True)
+                f"Unexpected error polling status: {e}", exc_info=True)
             click.echo(f"Unexpected error: {e}", err=True)
             break
 
@@ -370,10 +452,9 @@ async def _get_job_status_async(orchestrator_url: str, job_id: str, poll: bool =
                 await _poll_batch_status(client, orchestrator_url, job_id, None)
 
         except httpx.HTTPStatusError as e:
-            logger.error(
-                f"HTTP error: {e.response.status_code} - {e.response.text}", exc_info=True)
-            click.echo(
-                f"Error: {e.response.status_code} - {e.response.text}", err=True)
+            logger.error(f"HTTP error: {e.response.status_code} - {e.response.text}", exc_info=True,
+                         click.echo(
+                             f"Error: {e.response.status_code} - {e.response.text}", err=True)
         except httpx.RequestError as e:
             logger.error(f"Network error: {e}", exc_info=True)
             click.echo(f"Network error: {e}", err=True)
@@ -386,9 +467,9 @@ async def _get_job_results_async(orchestrator_url: str, job_id: str, output_path
     """Retrieves job results and saves to file or prints to stdout."""
     async with httpx.AsyncClient(timeout=600.0) as client:
         try:
-            response = await client.get(f"{orchestrator_url}/v1/jobs/{job_id}")
+            response=await client.get(f"{orchestrator_url}/v1/jobs/{job_id}")
             response.raise_for_status()
-            status_response = BatchJobStatusResponse.model_validate(
+            status_response=BatchJobStatusResponse.model_validate(
                 response.json())
 
             if status_response.status != "SUCCESS":
@@ -429,9 +510,9 @@ async def _health_check_async(orchestrator_url: str):
     """Checks health of all pipeline services."""
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
-            response = await client.get(f"{orchestrator_url}/health")
+            response=await client.get(f"{orchestrator_url}/health")
             response.raise_for_status()
-            health_data = response.json()
+            health_data=response.json()
 
             click.echo("=== EEE Pipeline Health Check ===")
             click.echo(
