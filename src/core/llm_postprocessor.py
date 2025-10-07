@@ -23,24 +23,34 @@ class LLMPostProcessor:
         """
         Recursively maps inconsistent field names and performs type normalization 
         before Pydantic validation.
+        
+        CRITICAL: Maps LLM output keys to schema-expected keys:
+        - "entities" -> "extracted_entities"
+        - "soa_triplets" -> "extracted_soa_triplets"
+        - "predicate" -> "action"
         """
         if isinstance(data, dict):
             new_data = {}
             for k, v in data.items():
                 new_k = k
-                # 1. Map inconsistent names (LLM hallucination fix)
-                if k == 'predicate':
+
+                # Map top-level response keys to schema-expected names
+                if k == 'entities':
+                    new_k = 'extracted_entities'
+                elif k == 'soa_triplets':
+                    new_k = 'extracted_soa_triplets'
+                # Map nested predicate to action
+                elif k == 'predicate':
                     new_k = 'action'
 
-                # 2. Recursively process nested structures
+                # Recursively process nested structures
                 processed_v = LLMPostProcessor.map_and_normalize_data(v)
 
-                # 3. Handle list vs. single entity for EventArgument flexibility (CRITICAL FIX)
-                # If the value is a list of dicts/models, assume it's meant for the 'entities' field
-                if k == 'entities' and isinstance(processed_v, list):
+                # Handle list vs. single entity for EventArgument flexibility
+                if k == 'entities' and isinstance(processed_v, list) and new_k == 'entities':
+                    # This is within an EventArgument, not the top level
                     new_data['entities'] = processed_v
                 elif k == 'entity' and processed_v is not None:
-                    # If LLM returns a list under the 'entity' key, rename it to 'entities'
                     if isinstance(processed_v, list):
                         new_data['entities'] = processed_v
                     else:
@@ -48,7 +58,7 @@ class LLMPostProcessor:
                 else:
                     new_data[new_k] = processed_v
 
-            # Final check to ensure 'entities' is used if a list was improperly mapped to 'entity'
+            # Final check for entity/entities at argument level
             if "entities" not in new_data and "entity" in new_data and isinstance(new_data["entity"], list):
                 new_data["entities"] = new_data["entity"]
                 del new_data["entity"]
@@ -58,8 +68,6 @@ class LLMPostProcessor:
         elif isinstance(data, list):
             return [LLMPostProcessor.map_and_normalize_data(item) for item in data]
 
-        # 4. Handle nulls and empty strings: Prefer returning None for optional Pydantic fields
-        # If a field is explicitly "" or None, return None. Pydantic handles null correctly.
         elif data == "" or data is None:
             return None
 
