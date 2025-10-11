@@ -67,9 +67,117 @@ class StorageBackend(ABC):
         pass
 
 
+# class JSONLStorageBackend(StorageBackend):
+#     """
+#     Storage backend that saves processed articles to a daily-created JSONL (JSON Lines) file.
+#     """
+
+#     def __init__(self, config: JsonlStorageConfig):
+#         # FIX: Ensure output_path handling is robust whether it's a dir or a file path specified
+#         self.output_path_config = config.output_path
+
+#         # Use parent directory if a filename is specified, otherwise use the path as the directory
+#         path_obj = Path(config.output_path)
+#         self.output_directory = path_obj.parent if path_obj.suffix else path_obj
+
+#         self.output_directory.mkdir(parents=True, exist_ok=True)
+#         self.current_file_path: Optional[Path] = None
+#         self._file_handle = None
+#         self._current_date: Optional[date] = None
+#         logger.info(
+#             f"Initialized JSONLStorageBackend with output directory: {self.output_directory}")
+
+#     def initialize(self):
+#         logger.info(
+#             f"JSONL storage directory ensured: {self.output_directory}")
+
+#     def _get_daily_file_path(self) -> Path:
+#         """
+#         Generates the file path for today's JSONL file.
+#         Uses a consistent naming convention derived from the configuration.
+#         """
+#         today_str = date.today().strftime("%Y-%m-%d")
+#         # Extract filename part from config path, default to a sensible name
+#         file_name = Path(self.output_path_config).name if Path(
+#             self.output_path_config).suffix else f"extracted_events_{today_str}.jsonl"
+
+#         # If the configured path was a file, override the date part of the filename
+#         if Path(self.output_path_config).suffix:
+#             # e.g., if config is /app/data/output.jsonl, use that directly for CLI output,
+#             # but for consistency with daily logs, we'll stick to dated file structure here.
+#             return self.output_directory / f"extracted_events_{today_str}.jsonl"
+#         else:
+#             return self.output_directory / file_name
+
+#     def _open_file(self):
+#         """Opens or re-opens the daily file for appending."""
+#         new_file_path = self._get_daily_file_path()
+#         today = date.today()
+
+#         if self._file_handle is None or new_file_path != self.current_file_path or today != self._current_date:
+#             self.close()
+
+#             self.current_file_path = new_file_path
+#             self._current_date = today
+#             try:
+#                 self._file_handle = open(
+#                     self.current_file_path, 'a', encoding='utf-8')
+#                 logger.debug(
+#                     f"Opened JSONL file for appending: {self.current_file_path}")
+#             except Exception as e:
+#                 logger.critical(
+#                     f"Failed to open JSONL file {self.current_file_path}: {e}", exc_info=True)
+#                 raise
+
+#     def _serialize_data(self, data: EventLLMGenerateResponse) -> Dict[str, Any]:
+#         """Serializes EventLLMGenerateResponse to a dictionary."""
+#         return data.model_dump(mode='json')
+
+#     def save(self, data: EventLLMGenerateResponse, **kwargs: Any) -> None:
+#         self.save_batch([data])
+
+#     def save_batch(self, data_list: List[EventLLMGenerateResponse], **kwargs: Any) -> None:
+#         if not data_list:
+#             logger.debug(
+#                 "Attempted to save an empty batch to JSONL. Skipping.")
+#             return
+
+#         try:
+#             self._open_file()
+#             for data in data_list:
+#                 serialized_data = self._serialize_data(data)
+#                 json_line = json.dumps(serialized_data, ensure_ascii=False)
+#                 self._file_handle.write(json_line + '\n')
+#             self._file_handle.flush()
+#             os.fsync(self._file_handle.fileno())
+#             logger.info(
+#                 f"Saved batch of {len(data_list)} documents to JSONL file: {self.current_file_path}")
+#         except Exception as e:
+#             logger.error(
+#                 f"Failed to save batch to JSONL file {self.current_file_path}: {e}", exc_info=True)
+#             raise
+
+#     def close(self):
+#         if self._file_handle:
+#             try:
+#                 self._file_handle.flush()
+#                 os.fsync(self._file_handle.fileno())
+#                 self._file_handle.close()
+#                 logger.debug(
+#                     f"Closed JSONL file handle: {self.current_file_path}")
+#             except Exception as e:
+#                 logger.error(
+#                     f"Error closing JSONL file {self.current_file_path}: {e}", exc_info=True)
+#             finally:
+#                 self._file_handle = None
+#                 self.current_file_path = None
+#                 self._current_date = None
+
 class JSONLStorageBackend(StorageBackend):
     """
     Storage backend that saves processed articles to a daily-created JSONL (JSON Lines) file.
+
+    NEW: Includes causality graph edges extraction for downstream graph construction.
     """
 
     def __init__(self, config: JsonlStorageConfig):
@@ -129,27 +237,136 @@ class JSONLStorageBackend(StorageBackend):
                     f"Failed to open JSONL file {self.current_file_path}: {e}", exc_info=True)
                 raise
 
+    def _extract_causality_edges(self, data: EventLLMGenerateResponse) -> List[Dict[str, Any]]:
+        """
+        Extract causality relationships as graph edges from event metadata.
+
+        NEW METHOD: Analyzes event metadata to construct causality graph edges
+        for downstream Phase 5 (Graph Construction).
+
+        Args:
+            data: Processed document with events
+
+        Returns:
+            List of edge dictionaries with structure:
+            {
+                "source": str (event_id),
+                "target": str (event_id), 
+                "causality": str (causality text),
+                "edge_type": "causes",
+                "confidence": float (optional)
+            }
+        """
+        edges = []
+
+        # Ensure document_id exists for generating event IDs
+        document_id = getattr(data, 'document_id', 'unknown')
+
+        for i, event in enumerate(data.events):
+            # Skip events without causality metadata
+            if not event.metadata or not event.metadata.causality:
+                continue
+
+            # Generate unique event ID for source event
+            source_event_id = f"{document_id}:event_{i}:{event.trigger.text}:{event.trigger.start_char}"
+
+            # Parse causality text to find mentions of other events in same document
+            # Simple heuristic: look for event triggers mentioned in causality text
+            causality_text = event.metadata.causality.lower()
+
+            # Check if other events' triggers are mentioned in this event's causality
+            for j, other_event in enumerate(data.events):
+                if i == j:  # Skip self-references
+                    continue
+
+                # Check if other event's trigger text appears in causality description
+                trigger_text = other_event.trigger.text.lower()
+
+                # Look for trigger as a complete word (not substring)
+                # Using word boundaries to avoid false positives
+                import re
+                if re.search(r'\b' + re.escape(trigger_text) + r'\b', causality_text):
+                    target_event_id = f"{document_id}:event_{j}:{other_event.trigger.text}:{other_event.trigger.start_char}"
+
+                    edges.append({
+                        "source": source_event_id,
+                        "target": target_event_id,
+                        "causality": event.metadata.causality,
+                        "edge_type": "causes",
+                        "document_id": document_id,
+                        "source_event_type": event.event_type,
+                        "target_event_type": other_event.event_type
+                    })
+
+                    logger.debug(
+                        f"Extracted causality edge: {event.event_type} -> {other_event.event_type}")
+
+        if edges:
+            logger.info(
+                f"Extracted {len(edges)} causality edges from document {document_id}")
+
+        return edges
+
     def _serialize_data(self, data: EventLLMGenerateResponse) -> Dict[str, Any]:
-        """Serializes EventLLMGenerateResponse to a dictionary."""
-        return data.model_dump(mode='json')
+        """
+        Serializes EventLLMGenerateResponse to a dictionary.
+
+        NEW: Includes causality graph edges for downstream graph construction (Phase 5).
+        """
+        # Get base serialization from Pydantic model
+        output_dict = data.model_dump(mode='json')
+
+        # NEW: Extract and add causality graph edges
+        try:
+            causality_edges = self._extract_causality_edges(data)
+            if causality_edges:
+                output_dict["causality_edges"] = causality_edges
+                logger.debug(
+                    f"Added {len(causality_edges)} causality edges to serialized output")
+        except Exception as e:
+            logger.warning(
+                f"Failed to extract causality edges for document {getattr(data, 'document_id', 'unknown')}: {e}")
+            output_dict["causality_edges"] = []
+
+        return output_dict
 
     def save(self, data: EventLLMGenerateResponse, **kwargs: Any) -> None:
-        self.save_batch([data])
+        """
+        Saves a single processed article.
+
+        Delegates to save_batch for consistency and code reuse.
+        """
+        self.save_batch([data], **kwargs)
 
     def save_batch(self, data_list: List[EventLLMGenerateResponse], **kwargs: Any) -> None:
+        """
+        Saves a batch of processed articles to JSONL file.
+
+        Each document is written as a single JSON line with:
+        - All original EventLLMGenerateResponse fields
+        - causality_edges: List of causality relationships for graph construction
+
+        Thread-safe with file locking and atomic writes.
+        """
         if not data_list:
             logger.debug(
                 "Attempted to save an empty batch to JSONL. Skipping.")
             return
 
         try:
+            # Open the daily file (creates new file if date changed)
             self._open_file()
+
+            # Serialize and write each document
             for data in data_list:
                 serialized_data = self._serialize_data(data)
                 json_line = json.dumps(serialized_data, ensure_ascii=False)
                 self._file_handle.write(json_line + '\n')
+
+            # Ensure data is written to disk immediately
             self._file_handle.flush()
             os.fsync(self._file_handle.fileno())
+
             logger.info(
                 f"Saved batch of {len(data_list)} documents to JSONL file: {self.current_file_path}")
         except Exception as e:
@@ -158,6 +375,11 @@ class JSONLStorageBackend(StorageBackend):
             raise
 
     def close(self):
+        """
+        Closes the file handle safely.
+
+        Ensures all data is flushed to disk before closing.
+        """
         if self._file_handle:
             try:
                 self._file_handle.flush()

@@ -8,6 +8,8 @@ import math
 import redis
 from fastapi import FastAPI, HTTPException, status, BackgroundTasks
 from pydantic import ValidationError
+from fastapi import UploadFile, File
+import json
 from typing import List, Dict, Any, Optional, Union
 from urllib.parse import urljoin
 from src.schemas.data_models import (
@@ -208,107 +210,105 @@ async def process_document(request: ProcessTextRequest):
 # CRITICAL NEW ENDPOINT: Enriched Document Processing
 # ===========================
 
-@app.post("/v1/documents/enriched", response_model=EnrichedDocumentResponse, status_code=status.HTTP_200_OK)
+@app.post("/v1/documents/enriched", status_code=status.HTTP_202_ACCEPTED)
 async def process_enriched_document(request: EnrichedDocumentRequest):
     """
-    Processes a document with rich metadata structure.
-    Extracts text based on configured field mapping and uses context fields to enhance LLM prompting.
+    Processes a document with rich metadata structure asynchronously.
+    Returns immediately with job tracking information.
     
-    **Route Convention**: POST /v1/documents/enriched (RESTful enriched resource creation)
-    **New in v1.1**: Supports flexible upstream schemas with configurable field mapping
+    **CRITICAL**: Enriched documents require LLM processing which takes 5-10 minutes.
+    This endpoint submits the job and returns a tracking URL immediately.
+    
+    Use GET /v1/jobs/{job_id} to poll for results.
     """
-    raw_document = request.dict()
+    # Generate job ID
+    job_id = str(uuid.uuid4())
+
+    # Convert single document to batch format
+    batch_request = EnrichedBatchRequest(
+        documents=[request.dict()],
+        job_id=job_id
+    )
+
     logger.info(
-        f"Received enriched document with fields: {list(raw_document.keys())}")
+        f"Received enriched document, submitting as async job {job_id}")
 
+    # Submit to batch processor
+    background_tasks = BackgroundTasks()
+    result = await submit_batch_job(batch_request, background_tasks)
+
+    # Return with helpful polling instructions
+    return {
+        "job_id": job_id,
+        "status": "SUBMITTED",
+        "message": "Document submitted for async processing. Results will be available in 5-10 minutes.",
+        "status_endpoint": f"/v1/jobs/{job_id}",
+        "polling_command": f"curl http://localhost:8000/v1/jobs/{job_id}",
+        "estimated_completion_minutes": 7
+    }
+
+
+
+@app.post("/v1/documents/enriched/upload", status_code=status.HTTP_202_ACCEPTED)
+async def upload_enriched_document(file: UploadFile = File(...)):
+    """
+    Upload a JSON or JSONL file with enriched documents for async processing.
+    
+    Supports:
+    - Single JSON file: {"document_id": "...", "cleaned_text": "...", ...}
+    - JSONL file: Multiple documents, one JSON per line
+    
+    Returns immediately with job tracking information.
+    """
     try:
-        # Extract text and context using document processor
-        enriched_input = document_processor.prepare_enriched_input(
-            raw_document)
-        text = enriched_input["text"]
-        context_metadata = enriched_input["context_metadata"]
-        upstream_entities = enriched_input["upstream_entities"]
-        source_document = enriched_input["source_document"]
+        content = await file.read()
+        content_str = content.decode('utf-8')
 
-        logger.info(
-            f"Extracted text (len: {len(text)}), context fields: {list(context_metadata.keys())}")
+        # Detect format
+        documents = []
+        if file.filename.endswith('.jsonl'):
+            # Parse JSONL
+            for line in content_str.strip().split('\n'):
+                if line.strip():
+                    documents.append(json.loads(line))
+            logger.info(f"Parsed {len(documents)} documents from JSONL file")
+        else:
+            # Parse single JSON
+            doc = json.loads(content_str)
+            documents = [doc]
+            logger.info(f"Parsed single document from JSON file")
 
-        # 1. Call NER Service
-        ner_url = urljoin(
-            str(settings.orchestrator_service.ner_service_url), "predict")
-        ner_response = await http_client.post(ner_url, json={"text": text})
-        ner_response.raise_for_status()
-        ner_results = NERPredictResponse.parse_obj(ner_response.json())
-        logger.debug(
-            f"NER service responded with {len(ner_results.entities)} entities.")
-
-        # Merge upstream entities with NER entities
-        merged_entities = document_processor.merge_entities(
-            upstream_entities,
-            [e.dict() for e in ner_results.entities]
-        )
-        logger.info(f"Merged entities: {len(merged_entities)} total")
-
-        # 2. Call DP Service
-        dp_url = urljoin(
-            str(settings.orchestrator_service.dp_service_url), "extract-soa")
-        dp_response = await http_client.post(dp_url, json={"text": text})
-        dp_response.raise_for_status()
-        dp_results = DPExtractSOAResponse.parse_obj(dp_response.json())
-        logger.debug(
-            f"DP service responded with {len(dp_results.soa_triplets)} S-O-A triplets.")
-
-        # 3. Prepare input for Event LLM Service with context metadata
-        from src.schemas.data_models import Entity
-        llm_input = EventLLMInput(
-            text=text,
-            ner_entities=[Entity.parse_obj(e) for e in merged_entities],
-            soa_triplets=dp_results.soa_triplets,
-            context_metadata=context_metadata  # CRITICAL: Pass context
-        )
-        logger.debug(
-            f"Prepared enriched input for Event LLM service with {len(context_metadata)} context fields.")
-
-        # 4. Call Event LLM Service
-        llm_url = urljoin(
-            str(settings.orchestrator_service.event_llm_service_url), "generate-events")
-        llm_response = await http_client.post(llm_url, json=llm_input.dict())
-        llm_response.raise_for_status()
-        final_output = EventLLMGenerateResponse.parse_obj(llm_response.json())
-        logger.info(f"Successfully processed enriched document.")
-
-        # Return enriched response with source document preserved
-        return EnrichedDocumentResponse(
-            **final_output.dict(),
-            source_document=source_document
+        # Submit as batch
+        job_id = str(uuid.uuid4())
+        batch_request = EnrichedBatchRequest(
+            documents=documents,
+            job_id=job_id
         )
 
-    except ValueError as e:
-        # Document processor validation errors (missing text field, etc.)
-        logger.warning(f"Document validation error: {e}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
-                            detail=f"Document validation error: {str(e)}")
-    except ValidationError as e:
-        logger.warning(
-            f"Invalid request/response payload: {e.errors()}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
-                            detail=f"Invalid data format: {e.errors()}")
-    except httpx.HTTPStatusError as e:
-        logger.error(
-            f"Error from upstream service {e.response.url}: {e.response.status_code} - {e.response.text}", exc_info=True)
-        raise HTTPException(status_code=e.response.status_code,
-                            detail=f"Upstream service error: {e.response.text}")
-    except httpx.RequestError as e:
-        logger.error(
-            f"Network error calling upstream service {e.request.url}: {e}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                            detail=f"Could not reach upstream service: {e.request.url}")
-    except Exception as e:
-        logger.error(
-            f"Internal server error during enriched document processing: {e}", exc_info=True)
+        background_tasks = BackgroundTasks()
+        await submit_batch_job(batch_request, background_tasks)
+
+        return {
+            "job_id": job_id,
+            "status": "SUBMITTED",
+            "documents_count": len(documents),
+            "message": f"Submitted {len(documents)} document(s) for async processing.",
+            "status_endpoint": f"/v1/jobs/{job_id}",
+            "polling_command": f"curl http://localhost:8000/v1/jobs/{job_id}",
+            "estimated_completion_minutes": len(documents) * 7
+        }
+
+    except json.JSONDecodeError as e:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error.")
-
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid JSON format: {str(e)}"
+        )
+    except Exception as e:
+        logger.error(f"Error processing file upload: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error processing upload: {str(e)}"
+        )
 
 @app.post("/v1/documents/batch", response_model=Dict[str, str], status_code=status.HTTP_202_ACCEPTED)
 async def submit_batch_job(request: Union[ProcessBatchRequest, EnrichedBatchRequest], background_tasks: BackgroundTasks):
