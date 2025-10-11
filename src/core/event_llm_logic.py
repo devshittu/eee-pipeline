@@ -1,3 +1,5 @@
+
+
 # src/core/event_llm_logic.py
 # File path: src/core/event_llm_logic.py
 
@@ -323,7 +325,7 @@ class EventLLMModel:
 
         else:
             raise ValueError(f"Invalid mode: {mode}")
-    
+
     def _call_llm(self, prompt: str) -> str:
         """
         Calls the LLM with the generated prompt and returns clean JSON string.
@@ -484,7 +486,12 @@ class EventLLMModel:
 
         return chunks
 
-    def _aggregate_results(self, chunked_responses: List[EventLLMGenerateResponse], original_text: str) -> EventLLMGenerateResponse:
+    def _aggregate_results(
+        self,
+        chunked_responses: List[EventLLMGenerateResponse],
+        original_text: str,
+        document_id: Optional[str] = None
+    ) -> EventLLMGenerateResponse:
         """
         Aggregates results from multiple chunks, resolving overlaps and de-duplicating events.
         """
@@ -546,13 +553,19 @@ class EventLLMModel:
         first_job_id = chunked_responses[0].job_id if chunked_responses and chunked_responses[0].job_id else str(
             uuid.uuid4())
 
-        return EventLLMGenerateResponse(
-            events=aggregated_events,
-            extracted_entities=aggregated_entities,
-            extracted_soa_triplets=aggregated_soa_triplets,
-            job_id=first_job_id,
-            original_text=original_text,
-            context_metadata=context_metadata
+        # CRITICAL FIX: Pass through to post_process_response instead of direct instantiation
+        aggregated_dict = {
+            'events': aggregated_events,
+            'extracted_entities': aggregated_entities,
+            'extracted_soa_triplets': aggregated_soa_triplets,
+            'job_id': first_job_id,
+            'original_text': original_text,
+            'context_metadata': context_metadata
+        }
+
+        return LLMPostProcessor.post_process_response(
+            aggregated_dict,
+            document_id=document_id
         )
 
     @retry(
@@ -617,6 +630,7 @@ class EventLLMModel:
             logger.error(error_msg, exc_info=True)
             raise LLMGenerationError(error_msg) from e
 
+
     def process_article_in_chunks(
         self,
         article_text: str,
@@ -633,17 +647,23 @@ class EventLLMModel:
         if not document_id:
             # Generate fallback ID
             import hashlib
-            document_id = hashlib.sha256(article_text.encode()).hexdigest()[:16]
+            document_id = hashlib.sha256(
+                article_text.encode()).hexdigest()[:16]
 
         if not article_text:
             logger.warning("Attempted to process an empty article.")
-            return EventLLMGenerateResponse(
-                events=[],
-                extracted_entities=[],
-                extracted_soa_triplets=[],
-                job_id=str(uuid.uuid4()),
-                original_text=article_text,
-                context_metadata=context_metadata
+            # CRITICAL FIX: Use post_process_response for empty response
+            return LLMPostProcessor.post_process_response(
+                {
+                    'events': [],
+                    'extracted_entities': [],
+                    'extracted_soa_triplets': [],
+                    'job_id': str(uuid.uuid4()),
+                    'original_text': article_text,
+                    'context_metadata': context_metadata
+                },
+                document_id=document_id,
+                normalized_date=normalized_date
             )
 
         if self.model is None or self.tokenizer is None:
@@ -714,31 +734,42 @@ class EventLLMModel:
                     f"Failed to process chunk {i+1}/{len(chunks)}. Skipping. Error: {type(e).__name__}: {e}", exc_info=True)
                 continue
 
+        # CRITICAL FIX: Pass document_id to aggregation
         aggregated_response = self._aggregate_results(
-            chunked_responses, article_text)
+            chunked_responses, article_text, document_id=document_id)
         logger.info(
             f"Aggregation complete. Found {len(aggregated_response.events)} low-level events and {len(aggregated_response.extracted_entities)} entities.")
 
         if len(chunks) == 1 and len(chunked_responses) == 1:
             logger.info(
                 "Single chunk processed successfully. Bypassing redundant synthesis step.")
-            return LLMPostProcessor.post_process_response(aggregated_response.dict())
+            # CRITICAL FIX: Use post_process_response with metadata
+            return LLMPostProcessor.post_process_response(
+                aggregated_response.dict(),
+                document_id=document_id,
+                normalized_date=normalized_date
+            )
 
         if not aggregated_response.events:
             logger.warning(
                 "No events extracted from any chunk. Skipping synthesis.")
-            return LLMPostProcessor.post_process_response(aggregated_response.dict())
+            # CRITICAL FIX: Use post_process_response with metadata
+            return LLMPostProcessor.post_process_response(
+                aggregated_response.dict(),
+                document_id=document_id,
+                normalized_date=normalized_date
+            )
 
         final_response = self._synthesize_main_events(
             article_text, aggregated_response)
 
+        # Inject metadata fields
         final_response.document_id = document_id
         final_response.normalized_date = normalized_date
         logger.info(
             f"Synthesis complete. Found {len(final_response.events)} main events.")
 
         return final_response
-
 
 # src/core/event_llm_logic.py
 # File path: src/core/event_llm_logic.py
