@@ -166,6 +166,7 @@ async def process_single_document_pipeline_async(document_data: Dict[str, Any]) 
             context_metadata = enriched_input["context_metadata"]
             upstream_entities = enriched_input["upstream_entities"]
             source_document = enriched_input["source_document"]
+            document_id = enriched_input["document_id"]  # NEW
 
             logger.info(
                 f"Extracted text (len: {len(text)}), context fields: {list(context_metadata.keys())}")
@@ -176,6 +177,7 @@ async def process_single_document_pipeline_async(document_data: Dict[str, Any]) 
             context_metadata = None
             upstream_entities = None
             source_document = None
+            document_id = doc_id  # Use provided ID or N/A
 
             if not text:
                 logger.warning(
@@ -215,6 +217,9 @@ async def process_single_document_pipeline_async(document_data: Dict[str, Any]) 
             # 4. Call Event LLM Service
             event_llm_response = await call_event_llm_service(http_client_local, llm_input)
 
+            # Inject document_id into response
+            event_llm_response.document_id = document_id  # NEW
+
         logger.info(f"Successfully processed document {doc_id}.")
 
         # Format result based on document type
@@ -240,6 +245,7 @@ def process_batch_task(self, payload_dict: Dict[str, Any]):
     Leverages Dask for parallel execution of single-document pipelines.
 
     CRITICAL ENHANCEMENT: Handles both simple texts and enriched documents.
+    NEW: Performs event linking across batch to identify co-referent events.
     """
     payload = CeleryBatchProcessTaskPayload.parse_obj(payload_dict)
     job_id = payload.job_id
@@ -250,6 +256,7 @@ def process_batch_task(self, payload_dict: Dict[str, Any]):
     logger.info(
         f"Celery task {task_id} (Job ID: {job_id}) started processing {total_docs_in_chunk} documents.")
 
+    # Step 1: Parallel document processing using Dask
     if not dask_client:
         logger.warning("Dask client not initialized. Processing sequentially.")
         results = []
@@ -265,7 +272,7 @@ def process_batch_task(self, payload_dict: Dict[str, Any]):
         logger.info(
             f"Dask parallel processing completed for {total_docs_in_chunk} documents.")
 
-    # Prepare results for persistence and return
+    # Step 2: Prepare results for persistence and validation
     processed_results: List[Dict[str, Any]] = []
     failed_count = 0
     successful_pydantic_objects: List[Any] = []
@@ -292,18 +299,106 @@ def process_batch_task(self, payload_dict: Dict[str, Any]):
             logger.error(
                 f"Document {res.get('id')} failed: {res.get('error') or 'Unknown error'}")
 
-    # Persistence step
+    # Step 3: Event Linking - Link events across all documents in this batch
+    if successful_pydantic_objects:
+        try:
+            from src.core.event_linker import EventLinker
+
+            logger.info(
+                f"Starting event linking for {len(successful_pydantic_objects)} documents...")
+
+            # Initialize event linker with configurable parameters
+            linker = EventLinker(
+                entity_overlap_threshold=0.5,  # 50% entity overlap required
+                temporal_window_days=7,         # Events within 7 days can be linked
+                min_entities_for_match=2        # At least 2 shared entities required
+            )
+
+            # Collect all events with metadata from all documents
+            events_with_metadata = []
+            for response_obj in successful_pydantic_objects:
+                # Ensure document_id exists (should be populated by pipeline)
+                doc_id = getattr(response_obj, 'document_id', 'unknown')
+                normalized_date = getattr(
+                    response_obj, 'normalized_date', None)
+
+                # Extract each event and create unique event_id
+                for event_idx, event in enumerate(response_obj.events):
+                    # Create deterministic event ID: document_id:trigger_text:start_char
+                    event_id = f"{doc_id}:event_{event_idx}:{event.trigger.text}:{event.trigger.start_char}"
+
+                    events_with_metadata.append({
+                        "event": event,
+                        "document_id": doc_id,
+                        "normalized_date": normalized_date,
+                        "event_id": event_id
+                    })
+
+            logger.info(
+                f"Collected {len(events_with_metadata)} events from batch for linking.")
+
+            # Perform event linking across batch
+            linked_groups = linker.link_events_in_batch(events_with_metadata)
+
+            logger.info(
+                f"Event linking identified {len(linked_groups)} groups of related events.")
+
+            # Step 4: Update event_references in response objects
+            # Build reverse lookup: event_id -> response_obj
+            event_to_response_map = {}
+            for response_obj in successful_pydantic_objects:
+                doc_id = getattr(response_obj, 'document_id', 'unknown')
+                for event_idx, event in enumerate(response_obj.events):
+                    event_id = f"{doc_id}:event_{event_idx}:{event.trigger.text}:{event.trigger.start_char}"
+                    event_to_response_map[event_id] = (response_obj, event_idx)
+
+            # Populate event_references field for linked events
+            for canonical_event_id, related_event_ids in linked_groups.items():
+                if canonical_event_id in event_to_response_map:
+                    response_obj, event_idx = event_to_response_map[canonical_event_id]
+
+                    # Store related event IDs (excluding self)
+                    related_ids = [
+                        eid for eid in related_event_ids if eid != canonical_event_id]
+
+                    # Initialize event_references if not set
+                    if not hasattr(response_obj, 'event_references') or response_obj.event_references is None:
+                        response_obj.event_references = []
+
+                    # Append related events to document-level event_references
+                    # Note: This is a document-level field that aggregates all linked events
+                    response_obj.event_references.extend(related_ids)
+
+            # Deduplicate event_references (in case of multiple events in same doc)
+            for response_obj in successful_pydantic_objects:
+                if hasattr(response_obj, 'event_references') and response_obj.event_references:
+                    response_obj.event_references = list(
+                        set(response_obj.event_references))
+
+            logger.info(
+                f"Event linking complete. Updated event_references for {len(linked_groups)} documents.")
+
+        except ImportError as e:
+            logger.error(
+                f"Failed to import EventLinker. Skipping event linking: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(
+                f"Error during event linking for Job ID {job_id}: {e}", exc_info=True)
+            # Continue with persistence even if linking fails
+
+    # Step 5: Persistence step - save to all configured backends
     if successful_pydantic_objects:
         try:
             backends = StorageBackendFactory.get_backends()
             for backend in backends:
                 backend.save_batch(successful_pydantic_objects)
             logger.info(
-                f"Celery task {task_id} successfully persisted {len(successful_pydantic_objects)} results.")
+                f"Celery task {task_id} successfully persisted {len(successful_pydantic_objects)} results to {len(backends)} backend(s).")
         except Exception as e:
             logger.error(
                 f"Failed to persist batch results for Job ID {job_id}: {e}", exc_info=True)
 
+    # Step 6: Prepare final task result
     successful_count = len(processed_results)
     logger.info(
         f"Celery task {task_id} (Job ID: {job_id}) finished. Processed {successful_count} successful, {failed_count} failed.")
@@ -317,6 +412,93 @@ def process_batch_task(self, payload_dict: Dict[str, Any]):
         "processed_count": successful_count,
         "total_count": total_docs_in_chunk
     }
+
+
+
+# @celery_app.task(bind=True)
+# def process_batch_task(self, payload_dict: Dict[str, Any]):
+#     """
+#     Celery task to process a batch of documents.
+#     Leverages Dask for parallel execution of single-document pipelines.
+
+#     CRITICAL ENHANCEMENT: Handles both simple texts and enriched documents.
+#     """
+#     payload = CeleryBatchProcessTaskPayload.parse_obj(payload_dict)
+#     job_id = payload.job_id
+#     task_id = payload.task_id
+#     text_data = payload.text_data
+#     total_docs_in_chunk = len(text_data)
+
+#     logger.info(
+#         f"Celery task {task_id} (Job ID: {job_id}) started processing {total_docs_in_chunk} documents.")
+
+#     if not dask_client:
+#         logger.warning("Dask client not initialized. Processing sequentially.")
+#         results = []
+#         for doc in text_data:
+#             results.append(asyncio.run(
+#                 process_single_document_pipeline_async(doc)))
+#     else:
+#         logger.info(
+#             f"Dispatching {total_docs_in_chunk} documents to Dask for parallel processing.")
+#         futures = [dask_client.submit(
+#             process_single_document_pipeline_async, doc) for doc in text_data]
+#         results = dask_client.gather(futures)
+#         logger.info(
+#             f"Dask parallel processing completed for {total_docs_in_chunk} documents.")
+
+#     # Prepare results for persistence and return
+#     processed_results: List[Dict[str, Any]] = []
+#     failed_count = 0
+#     successful_pydantic_objects: List[Any] = []
+
+#     for res in results:
+#         if res.get("success") and isinstance(res["result"], dict):
+#             try:
+#                 # Detect result type and parse accordingly
+#                 if "source_document" in res["result"]:
+#                     llm_response_model = EnrichedDocumentResponse.parse_obj(
+#                         res["result"])
+#                 else:
+#                     llm_response_model = EventLLMGenerateResponse.parse_obj(
+#                         res["result"])
+
+#                 successful_pydantic_objects.append(llm_response_model)
+#                 processed_results.append(res["result"])
+#             except Exception as e:
+#                 logger.error(
+#                     f"Result validation failed for document {res.get('id')}: {e}", exc_info=True)
+#                 failed_count += 1
+#         else:
+#             failed_count += 1
+#             logger.error(
+#                 f"Document {res.get('id')} failed: {res.get('error') or 'Unknown error'}")
+
+#     # Persistence step
+#     if successful_pydantic_objects:
+#         try:
+#             backends = StorageBackendFactory.get_backends()
+#             for backend in backends:
+#                 backend.save_batch(successful_pydantic_objects)
+#             logger.info(
+#                 f"Celery task {task_id} successfully persisted {len(successful_pydantic_objects)} results.")
+#         except Exception as e:
+#             logger.error(
+#                 f"Failed to persist batch results for Job ID {job_id}: {e}", exc_info=True)
+
+#     successful_count = len(processed_results)
+#     logger.info(
+#         f"Celery task {task_id} (Job ID: {job_id}) finished. Processed {successful_count} successful, {failed_count} failed.")
+
+#     return {
+#         "job_id": job_id,
+#         "task_id": task_id,
+#         "processed_data": processed_results,
+#         "success": failed_count == 0,
+#         "error": f"{failed_count} documents failed." if failed_count > 0 else None,
+#         "processed_count": successful_count,
+#         "total_count": total_docs_in_chunk
+#     }
 
 
 @celery_app.task
