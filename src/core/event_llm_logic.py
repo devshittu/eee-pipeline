@@ -621,12 +621,20 @@ class EventLLMModel:
         self,
         article_text: str,
         ner_entities: Optional[List[Entity]] = None,
-        context_metadata: Optional[Dict[str, Any]] = None
+        context_metadata: Optional[Dict[str, Any]] = None,
+        document_id: Optional[str] = None,
+        normalized_date: Optional[str] = None
     ) -> EventLLMGenerateResponse:
         """
         Main method to process a long article using a two-pass pipeline.
         Orchestrates chunking, individual chunk processing, and final synthesis.
         """
+
+        if not document_id:
+            # Generate fallback ID
+            import hashlib
+            document_id = hashlib.sha256(article_text.encode()).hexdigest()[:16]
+
         if not article_text:
             logger.warning("Attempted to process an empty article.")
             return EventLLMGenerateResponse(
@@ -723,6 +731,9 @@ class EventLLMModel:
 
         final_response = self._synthesize_main_events(
             article_text, aggregated_response)
+
+        final_response.document_id = document_id
+        final_response.normalized_date = normalized_date
         logger.info(
             f"Synthesis complete. Found {len(final_response.events)} main events.")
 
