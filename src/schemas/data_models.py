@@ -3,6 +3,7 @@
 
 from typing import List, Dict, Any, Optional, Union
 from pydantic import BaseModel, Field, HttpUrl, validator
+from datetime import datetime
 import uuid
 
 # --- Common Models ---
@@ -137,6 +138,19 @@ class EventLLMGenerateResponse(BaseModel):
     context_metadata: Optional[Dict[str, Any]] = Field(
         None, description="Context metadata used during generation.")
 
+    # NEW: Essential for downstream phases
+    document_id: str = Field(...,
+                             description="Unique document identifier from Phase 1")
+    normalized_date: Optional[datetime] = Field(
+        None, description="ISO-8601 normalized publication date")
+    story_cluster_id: Optional[str] = Field(
+        None, description="Assigned by Phase 4 clustering")
+
+    # NEW: For graph construction
+    event_references: Optional[List[str]] = Field(
+        default_factory=list,
+        description="IDs of related events (co-reference)"
+    )
 
 # --- Orchestrator Service Models ---
 
